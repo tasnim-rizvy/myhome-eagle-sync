@@ -211,12 +211,17 @@ class Eagle_Sync_Engine {
 
 		$postId = ! empty( $existing ) ? (int) $existing[0] : 0;
 
+		// Unique slug: {address}-{eagle id} so the permalink ends with the
+		// API id, e.g. /listing/21-mcguigan-drive-1741646/.
+		$slug = sanitize_title( $this->make_title( $data ) . '-' . $propertyId );
+
 		if ( 0 === $postId ) {
 			$postId = wp_insert_post(
 				[
 					'post_type'   => 'myhome_listing',
 					'post_status' => $this->map_status( $data['status'] ),
 					'post_title'  => $this->make_title( $data ),
+					'post_name'   => $slug,
 					'post_author' => $this->import_author_id(),
 				],
 				true
@@ -232,6 +237,7 @@ class Eagle_Sync_Engine {
 					'ID'          => $postId,
 					'post_status' => $this->map_status( $data['status'] ),
 					'post_title'  => $this->make_title( $data ),
+					'post_name'   => $slug,
 				]
 			);
 			$created = false;
