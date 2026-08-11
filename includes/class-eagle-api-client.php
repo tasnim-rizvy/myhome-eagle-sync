@@ -300,17 +300,19 @@ GRAPHQL;
 query CountProperties($limit: Int!, $offset: Int!) {
   properties(limit: $limit, offset: $offset) {
     totalCount
-    nodes { id }
+    nodes { id status }
   }
 }
 GRAPHQL;
 
 	/**
-	 * Exact number of listings available via the API.
+	 * Exact number of importable listings available via the API.
 	 *
 	 * totalCount is unreliable, so the count is derived by walking
-	 * ids-only pages until an incomplete page is returned. Returns 0
-	 * when the first request fails (caller falls back to a stored total).
+	 * ids-only pages until an incomplete page is returned. Draft
+	 * listings are excluded, matching the import (which skips them).
+	 * Returns 0 when the first request fails (caller falls back to a
+	 * stored total).
 	 */
 	public function count_properties(): int {
 		$count  = 0;
@@ -331,7 +333,12 @@ GRAPHQL;
 			}
 
 			$nodes = $data['properties']['nodes'] ?? [];
-			$count += count( $nodes );
+			foreach ( $nodes as $node ) {
+				if ( 'DRAFT' === (string) ( $node['status'] ?? '' ) ) {
+					continue;
+				}
+				$count++;
+			}
 
 			if ( count( $nodes ) < $limit ) {
 				break;

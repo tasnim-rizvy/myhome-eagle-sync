@@ -193,6 +193,11 @@ class Eagle_Sync_Engine {
 
 		$data = $this->flatten_node( $node );
 
+		// Never import draft listings; count them as skipped.
+		if ( 'DRAFT' === (string) ( $data['status'] ?? '' ) ) {
+			return 'skipped';
+		}
+
 		$existing = get_posts(
 			[
 				'post_type'      => 'myhome_listing',
