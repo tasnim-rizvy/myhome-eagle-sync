@@ -1,0 +1,69 @@
+.mes-wrap .mes-card {
+    background: #fff;
+    border: 1px solid #ccd0d4;
+    box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+    padding: 16px 20px;
+    margin-bottom: 20px;
+    max-width: 960px;
+}
+
+.mes-ok {
+    color: #008a20;
+    font-weight: 600;
+}
+
+.mes-warn {
+    color: #b26b00;
+    font-weight: 600;
+}
+
+.mes-hint {
+    color: #666;
+    font-size: 12px;
+}
+
+.mes-log {
+    background: #1d2327;
+    color: #c9d1d9;
+    padding: 12px;
+    max-height: 400px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.mes-status-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.mes-status {
+    margin: 10px 0 0;
+    font-weight: 600;
+}
+
+.mes-status-error {
+    color: #b32d2e;
+}
+
+.mes-spinner {
+    width: 16px;
+    height: 16px;
+    margin-top: 10px;
+    border: 2px solid #2271b1;
+    border-top-color: transparent;
+    border-radius: 50%;
+    display: inline-block;
+    animation: mes-spin 0.7s linear infinite;
+}
+
+.mes-spinner[hidden] {
+    display: none;
+}
+
+@keyframes mes-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
