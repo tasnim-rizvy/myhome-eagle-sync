@@ -3,7 +3,7 @@
  * Plugin Name:       MyHome Eagle Sync
  * Description:       Import real-estate listings from the Eagle Software GraphQL API (v3) into the myhome_listing post type.
  * Version:           0.1.0
- * Author:            WP Dashboard
+ * Author:            Tasnim Rizvy
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * License:           GPL-2.0-or-later
