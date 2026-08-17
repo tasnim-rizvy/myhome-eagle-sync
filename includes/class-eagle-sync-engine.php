@@ -710,6 +710,14 @@ class Eagle_Sync_Engine {
 				'lng'     => (string) ( $loc['longitude'] ?? '' ),
 				'address' => (string) ( $node['formattedAddress'] ?? '' ),
 			];
+		} elseif ( isset( $node['latitude'], $node['longitude'] ) && $node['latitude'] !== null && $node['longitude'] !== null ) {
+			// The API exposes coordinates as scalar fields, not as a
+			// location object; the map/search views need them stored.
+			$data['location'] = [
+				'lat'     => (string) $node['latitude'],
+				'lng'     => (string) $node['longitude'],
+				'address' => (string) ( $node['formattedAddress'] ?? '' ),
+			];
 		}
 
 		return $data;
