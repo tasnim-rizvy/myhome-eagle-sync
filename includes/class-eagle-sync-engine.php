@@ -337,11 +337,15 @@ class Eagle_Sync_Engine {
 					break;
 
 				case 'embed':
+					// MyHome only renders the "embed" key (oEmbed HTML) both in
+					// the admin preview and on the frontend; a bare URL is not
+					// enough, so resolve it via wp_oembed_get().
+					$embed = is_scalar( $value ) ? (string) $value : '';
 					$field->setValue(
 						$this->listing_model( $postId ),
 						[
-							'url'   => is_scalar( $value ) ? (string) $value : '',
-							'embed' => '',
+							'url'   => $embed,
+							'embed' => $embed !== '' ? (string) wp_oembed_get( $embed ) : '',
 						]
 					);
 					break;
