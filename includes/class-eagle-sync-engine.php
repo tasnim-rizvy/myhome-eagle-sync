@@ -64,6 +64,18 @@ class Eagle_Sync_Engine {
 		$state = self::get_state();
 		$batch = (int) apply_filters( 'mes_batch_size', 1 );
 
+		// One batch at a time: if another request (e.g. a second tab or a
+		// poll overlapping a slow request) is still working, report current
+		// progress and let the poll loop retry instead of importing twice.
+		if ( 'running' === ( $state['phase'] ?? '' ) && (int) ( $state['busy_until'] ?? 0 ) > time() ) {
+			return [
+				'phase'     => 'running',
+				'processed' => (int) ( $state['processed'] ?? 0 ),
+				'total'     => (int) ( $state['total'] ?? 0 ),
+				'offset'    => (int) ( $state['offset'] ?? 0 ),
+			];
+		}
+
 		if ( empty( $state['phase'] ) || 'running' !== $state['phase'] ) {
 			// Start a fresh run; seed the total with an exact API count so the
 			// progress can be shown as "processed/total" from the first batch.
@@ -90,10 +102,16 @@ class Eagle_Sync_Engine {
 			Eagle_Logger::log( sprintf( 'Sync started (batch size %d), total listings: %d.', $batch, $counted ) );
 		}
 
+		// Mark this request as the active worker so overlapping requests
+		// report progress instead of importing the same batch twice.
+		$state['busy_until'] = time() + 60;
+		self::set_state( $state );
+
 		$page = $this->client->fetch_properties_page( $batch, $state['offset'] );
 		if ( is_wp_error( $page ) ) {
 			$state['phase'] = 'error';
 			$state['last_error'] = $page->get_error_message();
+			unset( $state['busy_until'] );
 			self::set_state( $state );
 			return [ 'phase' => 'error', 'message' => $state['last_error'] ];
 		}
@@ -103,6 +121,7 @@ class Eagle_Sync_Engine {
 		if ( empty( $page['nodes'] ) && 0 === $state['processed'] ) {
 			// Empty result right away: nothing to import.
 			$state['phase'] = 'done';
+			unset( $state['busy_until'] );
 			self::set_state( $state );
 			Eagle_Logger::log( 'Sync finished: nothing to import.' );
 			return [ 'phase' => 'done', 'processed' => 0 ];
@@ -139,6 +158,7 @@ class Eagle_Sync_Engine {
 		if ( count( $page['nodes'] ) < $batch ) {
 			$state['phase'] = 'done';
 			$state['total'] = $state['processed'];
+			unset( $state['busy_until'] );
 			self::set_state( $state );
 			update_option(
 				MES_OPTION_SYNC_SUMMARY,
@@ -166,6 +186,8 @@ class Eagle_Sync_Engine {
 			return [ 'phase' => 'done', 'processed' => $state['processed'] ];
 		}
 
+		// Batch finished; release the lock so the next poll can continue.
+		unset( $state['busy_until'] );
 		self::set_state( $state );
 
 		return [
@@ -396,6 +418,7 @@ class Eagle_Sync_Engine {
 
 		$attachmentIds = [];
 		$eagleIds      = [];
+		$pending       = [];
 
 		foreach ( $images as $image ) {
 			$eagleId = (string) ( $image['id'] ?? '' );
@@ -425,13 +448,30 @@ class Eagle_Sync_Engine {
 				continue;
 			}
 
-			$attId = $this->sideload_image( $url, $postId );
+			$pending[] = [ 'url' => $url, 'eagleId' => $eagleId ];
+		}
+
+		// Download all new images in parallel: S3 throttles individual
+		// connections (measured ~140 KB/s each), so concurrency multiplies
+		// the aggregate throughput for large photos.
+		$downloaded = $this->download_images_parallel( array_column( $pending, 'url' ) );
+
+		foreach ( $pending as $image ) {
+			$got = $downloaded[ $image['url'] ] ?? null;
+			if ( ! $got || ! $got['ok'] ) {
+				if ( $got ) {
+					Eagle_Logger::error( 'Image download failed for ' . $image['url'] . ': ' . $got['error'] );
+				}
+				continue;
+			}
+
+			$attId = $this->insert_image_from_tmp( $image['url'], $got['tmp'], $postId );
 			if ( $attId ) {
-				if ( $eagleId !== '' ) {
-					update_post_meta( $attId, self::IMAGE_META, $eagleId );
+				if ( $image['eagleId'] !== '' ) {
+					update_post_meta( $attId, self::IMAGE_META, $image['eagleId'] );
 				}
 				$attachmentIds[] = $attId;
-				$eagleIds[]      = $eagleId;
+				$eagleIds[]      = $image['eagleId'];
 			}
 		}
 
@@ -454,17 +494,129 @@ class Eagle_Sync_Engine {
 		return true;
 	}
 
-	private function sideload_image( string $url, int $postId ) {
-		require_once ABSPATH . 'wp-admin/includes/media.php';
+	/**
+	 * Download several images concurrently with curl_multi.
+	 *
+	 * The S3 bucket throttles single connections (~140 KB/s), so 4 parallel
+	 * connections roughly triple aggregate throughput. Returns
+	 * [ url => [ 'ok' => bool, 'tmp' => ?string, 'error' => ?string ] ].
+	 */
+	private function download_images_parallel( array $urls ): array {
+		$result = [];
+
+		if ( empty( $urls ) || ! function_exists( 'curl_multi_init' ) ) {
+			foreach ( $urls as $url ) {
+				$result[ $url ] = [ 'ok' => false, 'tmp' => null, 'error' => 'curl_multi not available' ];
+			}
+			return $result;
+		}
+
+		$mh      = curl_multi_init();
+		$handles = [];
+
+		foreach ( $urls as $url ) {
+			$tmp = tempnam( sys_get_temp_dir(), 'mes-' );
+			if ( false === $tmp ) {
+				$result[ $url ] = [ 'ok' => false, 'tmp' => null, 'error' => 'temp file failed' ];
+				continue;
+			}
+
+			$fh = fopen( $tmp, 'wb' );
+			if ( false === $fh ) {
+				@unlink( $tmp );
+				$result[ $url ] = [ 'ok' => false, 'tmp' => null, 'error' => 'temp file open failed' ];
+				continue;
+			}
+
+			$ch = curl_init();
+			curl_setopt( $ch, CURLOPT_URL, $url );
+			curl_setopt( $ch, CURLOPT_FILE, $fh );
+			curl_setopt( $ch, CURLOPT_FOLLOWLOCATION, true );
+			curl_setopt( $ch, CURLOPT_TIMEOUT, 120 );
+			curl_setopt( $ch, CURLOPT_CONNECTTIMEOUT, 30 );
+			curl_setopt( $ch, CURLOPT_SSL_VERIFYPEER, true );
+
+			curl_multi_add_handle( $mh, $ch );
+			$handles[] = [ 'ch' => $ch, 'url' => $url, 'tmp' => $tmp, 'fh' => $fh ];
+		}
+
+		$active = null;
+		do {
+			$status = curl_multi_exec( $mh, $active );
+			if ( $active > 0 ) {
+				if ( curl_multi_select( $mh, 1.0 ) < 0 ) {
+					usleep( 100000 );
+				}
+			}
+		} while ( $active > 0 && CURLM_OK === $status );
+
+		foreach ( $handles as $entry ) {
+			$code = curl_getinfo( $entry['ch'], CURLINFO_RESPONSE_CODE );
+			$err  = curl_error( $entry['ch'] );
+			$errno = curl_errno( $entry['ch'] );
+
+			if ( is_resource( $entry['fh'] ) ) {
+				fclose( $entry['fh'] );
+			}
+
+			if ( CURLE_OK !== $errno ) {
+				@unlink( $entry['tmp'] );
+				$result[ $entry['url'] ] = [ 'ok' => false, 'tmp' => null, 'error' => 'cURL error ' . $errno . ': ' . $err ];
+			} elseif ( 200 !== $code ) {
+				@unlink( $entry['tmp'] );
+				$result[ $entry['url'] ] = [ 'ok' => false, 'tmp' => null, 'error' => 'HTTP ' . $code ];
+			} else {
+				$result[ $entry['url'] ] = [ 'ok' => true, 'tmp' => $entry['tmp'], 'error' => null ];
+			}
+
+			curl_multi_remove_handle( $mh, $entry['ch'] );
+			curl_close( $entry['ch'] );
+		}
+
+		curl_multi_close( $mh );
+
+		return $result;
+	}
+
+	/**
+	 * Create an attachment from a downloaded temp file.
+	 */
+	private function insert_image_from_tmp( string $url, string $tmp, int $postId ) {
 		require_once ABSPATH . 'wp-admin/includes/file.php';
 		require_once ABSPATH . 'wp-admin/includes/image.php';
+		require_once ABSPATH . 'wp-admin/includes/media.php';
 
-		$attId = media_sideload_image( $url, $postId, null, 'id' );
+		$file = [
+			'name'     => basename( $url ),
+			'type'     => wp_check_filetype( basename( $url ) )['type'],
+			'tmp_name' => $tmp,
+			'error'    => 0,
+			'size'     => filesize( $tmp ),
+		];
 
-		if ( is_wp_error( $attId ) ) {
-			Eagle_Logger::error( 'Image sideload failed for ' . $url . ': ' . $attId->get_error_message() );
+		$sideload = wp_handle_sideload( $file, [ 'test_form' => false ] );
+		if ( isset( $sideload['error'] ) ) {
+			@unlink( $tmp );
+			Eagle_Logger::error( 'Image sideload failed for ' . $url . ': ' . $sideload['error'] );
 			return false;
 		}
+
+		$attachment = [
+			'post_mime_type' => $sideload['type'],
+			'post_title'     => preg_replace( '/\.[^.]+$/', '', sanitize_file_name( basename( $sideload['file'] ) ) ),
+			'post_content'   => '',
+			'post_status'    => 'inherit',
+		];
+
+		$attId = wp_insert_attachment( $attachment, $sideload['file'], $postId );
+		if ( ! $attId || is_wp_error( $attId ) ) {
+			@unlink( $sideload['file'] );
+			Eagle_Logger::error( 'Attachment insert failed for ' . $url );
+			return false;
+		}
+
+		$meta = wp_generate_attachment_metadata( $attId, $sideload['file'] );
+		wp_update_attachment_metadata( $attId, $meta );
 
 		return (int) $attId;
 	}

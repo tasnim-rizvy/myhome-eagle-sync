@@ -209,13 +209,16 @@ GRAPHQL;
 	private function post_graphql( string $token, string $query, array $variables ) {
 		$attempts = 0;
 
-		while ( $attempts < 3 ) {
+		while ( $attempts < 2 ) {
 			$attempts++;
 
 			$response = wp_remote_post(
 				self::GRAPHQL_URL,
 				[
-					'timeout' => 120,
+					// The API answers in under a second when healthy; when it
+					// stalls it can ignore the timeout for minutes, so keep
+					// this short and let the next poll retry instead.
+					'timeout' => 30,
 					'headers' => [
 						'Content-Type'  => 'application/json',
 						'Authorization' => 'Bearer ' . $token,
@@ -231,8 +234,8 @@ GRAPHQL;
 			);
 
 			if ( is_wp_error( $response ) ) {
-				if ( $attempts < 3 ) {
-					sleep( 2 * $attempts );
+				if ( $attempts < 2 ) {
+					sleep( 2 );
 					continue;
 				}
 				return $response;
@@ -240,8 +243,8 @@ GRAPHQL;
 
 			$status = wp_remote_retrieve_response_code( $response );
 
-			if ( 429 === $status && $attempts < 3 ) {
-				sleep( 3 * $attempts );
+			if ( 429 === $status && $attempts < 2 ) {
+				sleep( 3 );
 				continue;
 			}
 
@@ -249,8 +252,8 @@ GRAPHQL;
 				return new WP_Error( 'mes_unauthorized', 'Unauthorized. Token may have expired.' );
 			}
 
-			if ( $status >= 500 && $attempts < 3 ) {
-				sleep( 3 * $attempts );
+			if ( $status >= 500 && $attempts < 2 ) {
+				sleep( 3 );
 				continue;
 			}
 

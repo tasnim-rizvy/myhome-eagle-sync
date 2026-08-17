@@ -19,7 +19,10 @@ class Eagle_Ajax {
 
 	public function import_batch(): void {
 		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( 120 );
+			// Image downloads are bandwidth-bound (S3 throttles to ~140 KB/s
+			// per connection); parallel downloads with 120s per-image timeouts
+			// need a generous budget.
+			@set_time_limit( 300 );
 		}
 
 		try {
