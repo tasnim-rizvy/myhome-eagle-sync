@@ -32,7 +32,7 @@ already exist on the site. No fields are ever auto-created.
 - Auth: header `Authorization: Bearer <token>`; also sends `Origin:
   https://www.eagleagent.com.au`.
 - Body: `{ "query": "...", "variables": {...} }`.
-- Retries: 3 attempts with backoff on network error, HTTP 429, and HTTP ≥500.
+- Retries: 2 attempts with backoff on network error, HTTP 429, and HTTP ≥500.
 - Returns `data.properties` = `{ totalCount, nodes: [...] }`.
 - Called by `Eagle_API_Client` only; engine and AJAX never talk to the API directly.
 
@@ -51,6 +51,26 @@ already exist on the site. No fields are ever auto-created.
   `_mes_eagle_property_id` and used to dedupe updates.
 - Images are remote HTTP S3 URLs; `media_sideload_image()` sometimes returns
   "Invalid image URL"/"Forbidden" — logged as errors, never fatal.
+- **Image-heavy listings (~100 MB) used to 503.** A single request downloaded
+  a listing's *entire* gallery; on the Hostinger box (1 CPU core, S3 throttled
+  to ~140 KB/s per connection) that request ran for minutes of wall-clock and
+  LiteSpeed/LVE killed it with a 503 — silently, because the kill is at the web
+  server and PHP's own timer doesn't count download wait (memory is a non-issue:
+  `memory_limit` is 1536M). Fixed on two axes:
+  1. **Resume per image.** The engine keeps `offset` on a listing until every
+     image is imported or exhausted; the 300 ms poll loop drives it. Dedup key =
+     eagle image id, else `url:<md5>` (stored in `_mes_eagle_image_id`). A
+     per-listing attempt counter (`_mes_eagle_image_attempts`, max
+     `mes_max_image_attempts` [3]) stops a broken URL from wedging the listing.
+  2. **Time-boxed streaming downloads** (`stream_download_image`): each request
+     pulls only a slice, and a large image is continued across polls with an
+     HTTP Range request. curl's timeout is capped to the slice, so no request
+     ever runs long enough to be killed. Partial files live in
+     `uploads/mes-tmp/<md5>.part` until complete, then sideload.
+  Budgets are filters: `mes_images_per_request` [4], `mes_bytes_per_request`
+  [20 MB], `mes_request_time_budget` [20s], `mes_max_image_attempts` [3].
+  Fatal errors that bypass try/catch (OOM, PHP timeout) are now captured by a
+  `register_shutdown_function` in `Eagle_Ajax` and written to the log.
 - `totalCount`-style pagination also affects the count walk: always `limit=50`.
 
 ## GraphQL query (what each listing node can contain)

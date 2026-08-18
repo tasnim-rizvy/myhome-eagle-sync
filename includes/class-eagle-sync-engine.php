@@ -15,6 +15,21 @@ class Eagle_Sync_Engine {
 	public const AGENTS_META = '_mes_eagle_agents';
 	public const OFFICE_META = '_mes_eagle_office';
 	public const CUSTOM_FIELDS_META = '_mes_eagle_custom_fields';
+	public const IMAGE_ATTEMPTS_META = '_mes_eagle_image_attempts';
+
+	// Per-request work budgets (all filterable). A single HTTP request never
+	// downloads or resizes more than these, so one image-heavy listing spans
+	// several polls instead of overrunning the proxy timeout or PHP memory
+	// limit (the cause of the 503s on ~100 MB listings).
+	private const DEFAULT_IMAGES_PER_REQUEST = 4;
+	private const DEFAULT_BYTES_PER_REQUEST  = 20971520; // 20 MB.
+	private const DEFAULT_TIME_BUDGET        = 20;        // Seconds of new work per request.
+	private const DEFAULT_MAX_IMAGE_ATTEMPTS = 3;
+
+	private int $request_deadline   = 0;
+	private int $images_remaining   = 0;
+	private int $bytes_remaining    = 0;
+	private int $max_image_attempts = 3;
 
 	// Eagle status => WP post status (keep everything visible per plan decision).
 	private const STATUS_MAP = [
@@ -64,15 +79,24 @@ class Eagle_Sync_Engine {
 		$state = self::get_state();
 		$batch = (int) apply_filters( 'mes_batch_size', 1 );
 
+		// Bound the work this request may do so it always finishes well within
+		// the server's request/memory limits, however small and unknown they are.
+		$this->request_deadline   = time() + max( 5, (int) apply_filters( 'mes_request_time_budget', self::DEFAULT_TIME_BUDGET ) );
+		$this->images_remaining   = max( 1, (int) apply_filters( 'mes_images_per_request', self::DEFAULT_IMAGES_PER_REQUEST ) );
+		$this->bytes_remaining    = max( 1048576, (int) apply_filters( 'mes_bytes_per_request', self::DEFAULT_BYTES_PER_REQUEST ) );
+		$this->max_image_attempts = max( 1, (int) apply_filters( 'mes_max_image_attempts', self::DEFAULT_MAX_IMAGE_ATTEMPTS ) );
+
 		// One batch at a time: if another request (e.g. a second tab or a
 		// poll overlapping a slow request) is still working, report current
 		// progress and let the poll loop retry instead of importing twice.
 		if ( 'running' === ( $state['phase'] ?? '' ) && (int) ( $state['busy_until'] ?? 0 ) > time() ) {
 			return [
-				'phase'     => 'running',
-				'processed' => (int) ( $state['processed'] ?? 0 ),
-				'total'     => (int) ( $state['total'] ?? 0 ),
-				'offset'    => (int) ( $state['offset'] ?? 0 ),
+				'phase'        => 'running',
+				'processed'    => (int) ( $state['processed'] ?? 0 ),
+				'total'        => (int) ( $state['total'] ?? 0 ),
+				'offset'       => (int) ( $state['offset'] ?? 0 ),
+				'images_done'  => (int) ( $state['current_images_done'] ?? 0 ),
+				'images_total' => (int) ( $state['current_images_total'] ?? 0 ),
 			];
 		}
 
@@ -103,8 +127,11 @@ class Eagle_Sync_Engine {
 		}
 
 		// Mark this request as the active worker so overlapping requests
-		// report progress instead of importing the same batch twice.
-		$state['busy_until'] = time() + 60;
+		// report progress instead of importing the same batch twice. The lease
+		// outlives one bounded request (time budget + one in-flight image
+		// download, which can reach its 120s curl timeout) yet still frees on
+		// its own if the request is killed.
+		$state['busy_until'] = time() + 180;
 		self::set_state( $state );
 
 		$page = $this->client->fetch_properties_page( $batch, $state['offset'] );
@@ -127,10 +154,30 @@ class Eagle_Sync_Engine {
 			return [ 'phase' => 'done', 'processed' => 0 ];
 		}
 
+		$nodeCount   = count( $page['nodes'] );
+		$completed   = 0;
+		$stalled     = false;
+		$imagesDone  = 0;
+		$imagesTotal = 0;
+
 		foreach ( $page['nodes'] as $node ) {
 			$result = $this->upsert_property( $node );
+
+			if ( ! $result['gallery_complete'] ) {
+				// This listing still has images to import. Leave the offset on
+				// it so the next poll resumes here (dedup skips finished
+				// images) instead of forcing a whole huge gallery through one
+				// request.
+				$stalled     = true;
+				$imagesDone  = (int) $result['images_done'];
+				$imagesTotal = (int) $result['images_total'];
+				break;
+			}
+
 			$state['processed']++;
-			switch ( $result ) {
+			$completed++;
+
+			switch ( $result['status'] ) {
 				case 'created':
 					$state['created']++;
 					break;
@@ -142,20 +189,36 @@ class Eagle_Sync_Engine {
 					break;
 				default:
 					$state['failed']++;
-					$state['last_error'] = 'Failed property: ' . ( $node['id'] ?? 'unknown' ) . ' (' . $result . ')';
+					$state['last_error'] = 'Failed property: ' . ( $node['id'] ?? 'unknown' ) . ' (' . $result['status'] . ')';
 					Eagle_Logger::error( $state['last_error'] );
+			}
+
+			// Stop cleanly once this request's time budget is spent; the next
+			// poll resumes at the advanced offset.
+			if ( time() >= $this->request_deadline ) {
+				break;
 			}
 		}
 
-		$state['offset'] += count( $page['nodes'] );
+		$state['offset'] += $completed;
+
+		// Surface sub-listing image progress while a large gallery imports.
+		if ( $stalled ) {
+			$state['current_images_done']  = $imagesDone;
+			$state['current_images_total'] = $imagesTotal;
+		} else {
+			unset( $state['current_images_done'], $state['current_images_total'] );
+		}
 
 		// Keep the progress estimate moving even while the run is ongoing.
 		$state['total'] = max( (int) $state['total'], $state['processed'] );
 
-		// The API sometimes reports an unreliable totalCount, so completion is
-		// decided by the page: when it returns fewer items than requested, the
-		// last page has been processed.
-		if ( count( $page['nodes'] ) < $batch ) {
+		// Completion: the whole page was consumed (no listing left mid-import)
+		// and it was a short page (fewer nodes than requested = last page). The
+		// API's totalCount is unreliable, so the page length decides.
+		$page_finished = ( ! $stalled ) && ( $completed === $nodeCount );
+
+		if ( $page_finished && $nodeCount < $batch ) {
 			$state['phase'] = 'done';
 			$state['total'] = $state['processed'];
 			unset( $state['busy_until'] );
@@ -191,10 +254,12 @@ class Eagle_Sync_Engine {
 		self::set_state( $state );
 
 		return [
-			'phase'     => 'running',
-			'processed' => $state['processed'],
-			'total'     => $state['total'],
-			'offset'    => $state['offset'],
+			'phase'        => 'running',
+			'processed'    => $state['processed'],
+			'total'        => $state['total'],
+			'offset'       => $state['offset'],
+			'images_done'  => (int) ( $state['current_images_done'] ?? 0 ),
+			'images_total' => (int) ( $state['current_images_total'] ?? 0 ),
 		];
 	}
 
@@ -205,19 +270,23 @@ class Eagle_Sync_Engine {
 	/**
 	 * Create or update one listing post.
 	 *
-	 * @return string created|updated|skipped|error message
+	 * Galleries are imported in bounded chunks, so a listing may need several
+	 * calls before it is fully done. The caller advances past the listing only
+	 * once 'gallery_complete' is true.
+	 *
+	 * @return array{status:string,gallery_complete:bool,images_done:int,images_total:int}
 	 */
-	private function upsert_property( array $node ): string {
+	private function upsert_property( array $node ): array {
 		$propertyId = (string) ( $node['id'] ?? '' );
 		if ( $propertyId === '' ) {
-			return 'missing id';
+			return $this->upsert_result( 'missing id' );
 		}
 
 		$data = $this->flatten_node( $node );
 
 		// Never import draft listings; count them as skipped.
 		if ( 'DRAFT' === (string) ( $data['status'] ?? '' ) ) {
-			return 'skipped';
+			return $this->upsert_result( 'skipped' );
 		}
 
 		$existing = get_posts(
@@ -249,7 +318,7 @@ class Eagle_Sync_Engine {
 				true
 			);
 			if ( is_wp_error( $postId ) || ! $postId ) {
-				return is_wp_error( $postId ) ? $postId->get_error_message() : 'insert failed';
+				return $this->upsert_result( is_wp_error( $postId ) ? $postId->get_error_message() : 'insert failed' );
 			}
 			update_post_meta( $postId, self::PROPERTY_META, $propertyId );
 			$created = true;
@@ -274,22 +343,37 @@ class Eagle_Sync_Engine {
 			$errors[] = 'field write failed';
 		}
 
-		if ( ! $this->write_gallery( $postId, $data['images'], 'gallery' ) ) {
-			$errors[] = 'gallery failed';
-		}
-
-		if ( ! empty( $data['floorplans'] ) ) {
-			$this->write_gallery( $postId, $data['floorplans'], 'floorplans' );
-		}
+		// Import galleries in bounded chunks; a large listing therefore spans
+		// several polls rather than one oversized request.
+		$gallery    = $this->write_gallery( $postId, $data['images'], 'gallery' );
+		$floorplans = $this->write_gallery( $postId, $data['floorplans'], 'floorplans' );
 
 		$this->write_agents( $postId, $data );
 		$this->write_custom_fields( $postId, $data );
 
+		$status = $created ? 'created' : 'updated';
 		if ( ! empty( $errors ) ) {
-			return implode( ', ', $errors );
+			$status = implode( ', ', $errors );
 		}
 
-		return $created ? 'created' : 'updated';
+		return $this->upsert_result(
+			$status,
+			$gallery['complete'] && $floorplans['complete'],
+			$gallery['done'] + $floorplans['done'],
+			$gallery['total'] + $floorplans['total']
+		);
+	}
+
+	/**
+	 * Build the structured result returned by upsert_property().
+	 */
+	private function upsert_result( string $status, bool $galleryComplete = true, int $done = 0, int $total = 0 ): array {
+		return [
+			'status'           => $status,
+			'gallery_complete' => $galleryComplete,
+			'images_done'      => $done,
+			'images_total'     => $total,
+		];
 	}
 
 	// ---------------------------------------------------------------------
@@ -408,178 +492,307 @@ class Eagle_Sync_Engine {
 	}
 
 	/**
-	 * Sideload images into the gallery field (dedupe by eagle image id).
+	 * Import images into a gallery field in bounded chunks.
+	 *
+	 * Only a limited number of new images are downloaded per call — capped by
+	 * count, cumulative bytes and the per-request time budget — while
+	 * already-imported images are reused (dedup) and images that keep failing
+	 * are eventually skipped so they cannot wedge the listing. A large gallery
+	 * therefore completes across several polls instead of one oversized
+	 * request, which is what was triggering the 503s.
+	 *
+	 * @return array{complete:bool,done:int,total:int}
 	 */
-	private function write_gallery( int $postId, array $images, string $fieldKey ): bool {
+	private function write_gallery( int $postId, array $images, string $fieldKey ): array {
 		if ( empty( $images ) ) {
-			return true;
+			return [ 'complete' => true, 'done' => 0, 'total' => 0 ];
 		}
 
 		$fieldId = $this->fields->get_field_id( $fieldKey );
 		if ( ! $fieldId ) {
-			return true;
+			// No target field on this site; nothing to import here.
+			return [ 'complete' => true, 'done' => 0, 'total' => 0 ];
 		}
 
+		$attempts = get_post_meta( $postId, self::IMAGE_ATTEMPTS_META, true );
+		if ( ! is_array( $attempts ) ) {
+			$attempts = [];
+		}
+
+		$total         = 0;
+		$done          = 0;
 		$attachmentIds = [];
-		$eagleIds      = [];
 		$pending       = [];
 
 		foreach ( $images as $image ) {
-			$eagleId = (string) ( $image['id'] ?? '' );
-			$url     = (string) ( $image['url'] ?? '' );
-
+			$url = (string) ( $image['url'] ?? '' );
 			if ( $url === '' ) {
 				continue;
 			}
+			$total++;
 
-			// Reuse already-downloaded image.
-			$existing = $eagleId !== ''
-				? get_posts(
-					[
-						'post_type'      => 'attachment',
-						'post_status'    => 'any',
-						'posts_per_page' => 1,
-						'meta_key'       => self::IMAGE_META,
-						'meta_value'     => $eagleId,
-						'fields'         => 'ids',
-					]
-				)
-				: [];
+			$key      = $this->image_dedup_key( $image );
+			$existing = $this->find_attachment_by_key( $key );
 
-			if ( ! empty( $existing ) ) {
-				$attachmentIds[] = (int) $existing[0];
-				$eagleIds[]      = $eagleId;
+			if ( $existing ) {
+				$attachmentIds[] = $existing;
+				$done++;
 				continue;
 			}
 
-			$pending[] = [ 'url' => $url, 'eagleId' => $eagleId ];
+			// Give up on images that have already failed too many times so a
+			// single broken URL can never block the listing forever; count them
+			// as resolved so the gallery can reach "complete".
+			if ( (int) ( $attempts[ $key ] ?? 0 ) >= $this->max_image_attempts ) {
+				$done++;
+				continue;
+			}
+
+			$pending[] = [ 'url' => $url, 'key' => $key ];
 		}
 
-		// Download all new images in parallel: S3 throttles individual
-		// connections (measured ~140 KB/s each), so concurrency multiplies
-		// the aggregate throughput for large photos.
-		$downloaded = $this->download_images_parallel( array_column( $pending, 'url' ) );
-
+		// Download pending images in time-boxed slices, resuming a large image
+		// across polls with HTTP Range. This keeps every request short in
+		// wall-clock so Hostinger's LiteSpeed/LVE never kills it (the 503), no
+		// matter how slow S3 is or how big a single photo is.
+		$touched = false;
 		foreach ( $pending as $image ) {
-			$got = $downloaded[ $image['url'] ] ?? null;
-			if ( ! $got || ! $got['ok'] ) {
-				if ( $got ) {
-					Eagle_Logger::error( 'Image download failed for ' . $image['url'] . ': ' . $got['error'] );
+			if ( $this->images_remaining <= 0 || $this->bytes_remaining <= 0 || time() >= $this->request_deadline ) {
+				break;
+			}
+
+			$slice = max( 3, $this->request_deadline - time() );
+			$res   = $this->stream_download_image( $image['url'], $image['key'], $slice );
+			$touched = true;
+
+			$this->bytes_remaining -= (int) ( $res['bytes'] ?? 0 );
+
+			if ( 'complete' === $res['status'] ) {
+				$this->maybe_raise_image_memory();
+				$attId = $this->insert_image_from_tmp( $image['url'], $res['tmp'], $postId );
+				if ( $attId ) {
+					update_post_meta( $attId, self::IMAGE_META, $image['key'] );
+					$attachmentIds[] = $attId;
+					$done++;
+					$this->images_remaining--;
+					unset( $attempts[ $image['key'] ] );
+				} else {
+					$attempts[ $image['key'] ] = (int) ( $attempts[ $image['key'] ] ?? 0 ) + 1;
 				}
 				continue;
 			}
 
-			$attId = $this->insert_image_from_tmp( $image['url'], $got['tmp'], $postId );
-			if ( $attId ) {
-				if ( $image['eagleId'] !== '' ) {
-					update_post_meta( $attId, self::IMAGE_META, $image['eagleId'] );
-				}
-				$attachmentIds[] = $attId;
-				$eagleIds[]      = $image['eagleId'];
+			if ( 'partial' === $res['status'] ) {
+				// Still downloading; it resumes on the next poll. This request's
+				// budget is spent on this one image.
+				break;
+			}
+
+			// Failed this attempt; count it so a permanently broken URL is
+			// eventually skipped instead of wedging the listing.
+			$attempts[ $image['key'] ] = (int) ( $attempts[ $image['key'] ] ?? 0 ) + 1;
+			if ( ! empty( $res['error'] ) ) {
+				Eagle_Logger::error( 'Image download failed for ' . $image['url'] . ': ' . $res['error'] );
 			}
 		}
 
-		if ( empty( $attachmentIds ) ) {
-			return true;
+		if ( $touched ) {
+			update_post_meta( $postId, self::IMAGE_ATTEMPTS_META, $attempts );
 		}
 
-		// Update the field and the featured image if not set yet.
-		$field = tdf_field_factory()->create( $fieldId );
-		if ( $field ) {
-			$field->setValue( $this->listing_model( $postId ), $attachmentIds );
+		// Update the field with everything gathered so far and set the featured
+		// image on the first pass; both are safe to repeat as the gallery grows.
+		if ( ! empty( $attachmentIds ) ) {
+			$field = tdf_field_factory()->create( $fieldId );
+			if ( $field ) {
+				$field->setValue( $this->listing_model( $postId ), $attachmentIds );
+			}
+
+			if ( ! has_post_thumbnail( $postId ) ) {
+				set_post_thumbnail( $postId, $attachmentIds[0] );
+			}
 		}
 
-		if ( ! has_post_thumbnail( $postId ) ) {
-			set_post_thumbnail( $postId, $attachmentIds[0] );
-		}
-
-		update_post_meta( $postId, '_mes_eagle_' . $fieldKey . '_ids', $eagleIds );
-
-		return true;
+		return [
+			'complete' => $done >= $total,
+			'done'     => $done,
+			'total'    => $total,
+		];
 	}
 
 	/**
-	 * Download several images concurrently with curl_multi.
-	 *
-	 * The S3 bucket throttles single connections (~140 KB/s), so 4 parallel
-	 * connections roughly triple aggregate throughput. Returns
-	 * [ url => [ 'ok' => bool, 'tmp' => ?string, 'error' => ?string ] ].
+	 * Stable per-image identity used to dedupe downloads across polls. Falls
+	 * back to a hash of the URL when the API omits the image id, so a resumed
+	 * import never re-downloads the same photo.
 	 */
-	private function download_images_parallel( array $urls ): array {
-		$result = [];
-
-		if ( empty( $urls ) || ! function_exists( 'curl_multi_init' ) ) {
-			foreach ( $urls as $url ) {
-				$result[ $url ] = [ 'ok' => false, 'tmp' => null, 'error' => 'curl_multi not available' ];
-			}
-			return $result;
+	private function image_dedup_key( array $image ): string {
+		$eagleId = (string) ( $image['id'] ?? '' );
+		if ( $eagleId !== '' ) {
+			return $eagleId;
 		}
 
-		$mh      = curl_multi_init();
-		$handles = [];
+		return 'url:' . md5( (string) ( $image['url'] ?? '' ) );
+	}
 
-		foreach ( $urls as $url ) {
-			$tmp = tempnam( sys_get_temp_dir(), 'mes-' );
-			if ( false === $tmp ) {
-				$result[ $url ] = [ 'ok' => false, 'tmp' => null, 'error' => 'temp file failed' ];
-				continue;
-			}
-
-			$fh = fopen( $tmp, 'wb' );
-			if ( false === $fh ) {
-				@unlink( $tmp );
-				$result[ $url ] = [ 'ok' => false, 'tmp' => null, 'error' => 'temp file open failed' ];
-				continue;
-			}
-
-			$ch = curl_init();
-			curl_setopt( $ch, CURLOPT_URL, $url );
-			curl_setopt( $ch, CURLOPT_FILE, $fh );
-			curl_setopt( $ch, CURLOPT_FOLLOWLOCATION, true );
-			curl_setopt( $ch, CURLOPT_TIMEOUT, 120 );
-			curl_setopt( $ch, CURLOPT_CONNECTTIMEOUT, 30 );
-			curl_setopt( $ch, CURLOPT_SSL_VERIFYPEER, true );
-
-			curl_multi_add_handle( $mh, $ch );
-			$handles[] = [ 'ch' => $ch, 'url' => $url, 'tmp' => $tmp, 'fh' => $fh ];
+	/**
+	 * Attachment id previously imported for this image key, or 0.
+	 */
+	private function find_attachment_by_key( string $key ): int {
+		if ( $key === '' ) {
+			return 0;
 		}
 
-		$active = null;
-		do {
-			$status = curl_multi_exec( $mh, $active );
-			if ( $active > 0 ) {
-				if ( curl_multi_select( $mh, 1.0 ) < 0 ) {
-					usleep( 100000 );
+		$existing = get_posts(
+			[
+				'post_type'      => 'attachment',
+				'post_status'    => 'any',
+				'posts_per_page' => 1,
+				'meta_key'       => self::IMAGE_META,
+				'meta_value'     => $key,
+				'fields'         => 'ids',
+				'no_found_rows'  => true,
+			]
+		);
+
+		return ! empty( $existing ) ? (int) $existing[0] : 0;
+	}
+
+	/**
+	 * Raise the memory ceiling for image processing when WordPress allows it.
+	 */
+	private function maybe_raise_image_memory(): void {
+		if ( function_exists( 'wp_raise_memory_limit' ) ) {
+			wp_raise_memory_limit( 'image' );
+		}
+	}
+
+	/**
+	 * Download one image in a time-boxed slice, resuming across calls.
+	 *
+	 * The partial download is persisted under uploads/mes-tmp and continued on
+	 * the next poll with an HTTP Range request, so an arbitrarily large image
+	 * is fetched over several short requests instead of one long request that
+	 * the host would kill. curl's own timeout is capped to the slice, which is
+	 * what actually bounds each request's wall-clock.
+	 *
+	 * @return array{status:string,tmp:?string,error:?string,bytes:int}
+	 *         status: complete | partial | failed
+	 */
+	private function stream_download_image( string $url, string $key, int $budget ): array {
+		if ( ! function_exists( 'curl_init' ) ) {
+			return [ 'status' => 'failed', 'tmp' => null, 'error' => 'curl unavailable', 'bytes' => 0 ];
+		}
+
+		$dir = $this->partial_dir();
+		if ( '' === $dir ) {
+			return [ 'status' => 'failed', 'tmp' => null, 'error' => 'no temp dir', 'bytes' => 0 ];
+		}
+
+		$part   = $dir . '/' . md5( $key ) . '.part';
+		$offset = file_exists( $part ) ? (int) filesize( $part ) : 0;
+
+		$fh = fopen( $part, 'cb' ); // Open for write, keep existing bytes.
+		if ( false === $fh ) {
+			return [ 'status' => 'failed', 'tmp' => null, 'error' => 'cannot open partial', 'bytes' => 0 ];
+		}
+		fseek( $fh, 0, SEEK_END );
+
+		$total    = 0;
+		$sawRange = false;
+
+		$ch = curl_init();
+		curl_setopt( $ch, CURLOPT_URL, $url );
+		curl_setopt( $ch, CURLOPT_FILE, $fh );
+		curl_setopt( $ch, CURLOPT_FOLLOWLOCATION, true );
+		curl_setopt( $ch, CURLOPT_SSL_VERIFYPEER, true );
+		curl_setopt( $ch, CURLOPT_CONNECTTIMEOUT, min( 15, max( 5, $budget ) ) );
+		curl_setopt( $ch, CURLOPT_TIMEOUT, max( 5, $budget ) );
+		if ( $offset > 0 ) {
+			curl_setopt( $ch, CURLOPT_RESUME_FROM, $offset );
+		}
+		curl_setopt(
+			$ch,
+			CURLOPT_HEADERFUNCTION,
+			static function ( $handle, $header ) use ( &$total, &$sawRange, $offset ) {
+				if ( 0 === stripos( $header, 'Content-Range:' ) ) {
+					if ( preg_match( '#/\s*(\d+)\s*$#', $header, $m ) ) {
+						$total = (int) $m[1];
+					}
+					$sawRange = true;
+				} elseif ( 0 === $offset && ! $sawRange && 0 === stripos( $header, 'Content-Length:' ) ) {
+					$total = (int) trim( substr( $header, strlen( 'Content-Length:' ) ) );
 				}
+				return strlen( $header );
 			}
-		} while ( $active > 0 && CURLM_OK === $status );
+		);
 
-		foreach ( $handles as $entry ) {
-			$code = curl_getinfo( $entry['ch'], CURLINFO_RESPONSE_CODE );
-			$err  = curl_error( $entry['ch'] );
-			$errno = curl_errno( $entry['ch'] );
+		curl_exec( $ch );
+		$errno = curl_errno( $ch );
+		$code  = (int) curl_getinfo( $ch, CURLINFO_RESPONSE_CODE );
+		$err   = curl_error( $ch );
+		curl_close( $ch );
+		fclose( $fh );
 
-			if ( is_resource( $entry['fh'] ) ) {
-				fclose( $entry['fh'] );
-			}
+		$have  = file_exists( $part ) ? (int) filesize( $part ) : 0;
+		$bytes = max( 0, $have - $offset );
 
-			if ( CURLE_OK !== $errno ) {
-				@unlink( $entry['tmp'] );
-				$result[ $entry['url'] ] = [ 'ok' => false, 'tmp' => null, 'error' => 'cURL error ' . $errno . ': ' . $err ];
-			} elseif ( 200 !== $code ) {
-				@unlink( $entry['tmp'] );
-				$result[ $entry['url'] ] = [ 'ok' => false, 'tmp' => null, 'error' => 'HTTP ' . $code ];
-			} else {
-				$result[ $entry['url'] ] = [ 'ok' => true, 'tmp' => $entry['tmp'], 'error' => null ];
-			}
-
-			curl_multi_remove_handle( $mh, $entry['ch'] );
-			curl_close( $entry['ch'] );
+		// Server ignored the Range (200 to a ranged request): our appended
+		// partial is now inconsistent — discard it and restart next poll.
+		if ( $offset > 0 && 200 === $code ) {
+			@unlink( $part );
+			return [ 'status' => 'partial', 'tmp' => null, 'error' => null, 'bytes' => 0 ];
 		}
 
-		curl_multi_close( $mh );
+		// 416 = requested range past EOF, i.e. we already hold the whole file.
+		if ( 416 === $code && $have > 0 ) {
+			return [ 'status' => 'complete', 'tmp' => $part, 'error' => null, 'bytes' => 0 ];
+		}
 
-		return $result;
+		// Non-retryable HTTP errors: drop the partial so a later run starts clean.
+		if ( $code >= 400 ) {
+			if ( ! ( 429 === $code || $code >= 500 ) ) {
+				@unlink( $part );
+			}
+			return [ 'status' => 'failed', 'tmp' => null, 'error' => 'HTTP ' . $code, 'bytes' => $bytes ];
+		}
+
+		$complete = ( $total > 0 && $have >= $total )
+			|| ( CURLE_OK === $errno && 0 === $offset && 200 === $code && $have > 0 && 0 === $total );
+
+		if ( $complete && $have > 0 ) {
+			return [ 'status' => 'complete', 'tmp' => $part, 'error' => null, 'bytes' => $bytes ];
+		}
+
+		// Made progress but not finished (usually the slice timed out): resume.
+		if ( $bytes > 0 ) {
+			return [ 'status' => 'partial', 'tmp' => null, 'error' => null, 'bytes' => $bytes ];
+		}
+
+		// No progress at all: report a failure so repeated dead attempts exhaust.
+		return [
+			'status' => 'failed',
+			'tmp'    => null,
+			'error'  => '' !== $err ? ( 'cURL ' . $errno . ': ' . $err ) : ( 'HTTP ' . $code ),
+			'bytes'  => 0,
+		];
+	}
+
+	/**
+	 * Directory for in-progress image downloads (created on demand). Empty
+	 * string when the uploads directory is unavailable.
+	 */
+	private function partial_dir(): string {
+		$uploads = wp_upload_dir();
+		if ( ! empty( $uploads['error'] ) || empty( $uploads['basedir'] ) ) {
+			return '';
+		}
+
+		$dir = $uploads['basedir'] . '/mes-tmp';
+		if ( ! is_dir( $dir ) ) {
+			wp_mkdir_p( $dir );
+		}
+
+		return is_dir( $dir ) ? $dir : '';
 	}
 
 	/**

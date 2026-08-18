@@ -32,7 +32,11 @@
 
 					var data = res.data;
 					if (data.phase === 'running') {
-						setStatus('Checking, importing and updating... ' + data.processed + '/' + data.total + '');
+						var msg = 'Checking, importing and updating... ' + data.processed + '/' + data.total;
+						if (data.images_total && data.images_total > 0) {
+							msg += ' (images ' + data.images_done + '/' + data.images_total + ')';
+						}
+						setStatus(msg);
 						setSpinner(true);
 						setTimeout(step, 300);
 					} else if (data.phase === 'done') {
