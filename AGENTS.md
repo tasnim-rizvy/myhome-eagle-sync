@@ -128,7 +128,7 @@ resolves each Eagle key to a field ID, preferring fields already in use by listi
 
 | Eagle key                | Field ID |
 |--------------------------|----------|
-| gallery / floorplans     | 145      |
+| gallery                  | 145      |
 | location                 | 153      |
 | bedrooms                 | 5462     |
 | bathrooms                | 5463     |
@@ -158,6 +158,10 @@ The `status` key is deliberately never written as a field.
 - Listings upsert by `_mes_eagle_property_id`; galleries dedupe via
   `_mes_eagle_image_id` and set the featured image if missing; agents/office stored
   as post meta (`agents` office arrays are reduced to `office.name` string).
+- **Only the API `images` array is imported into the gallery field.**
+  `floorplans` is deliberately ignored: both collections map to the same
+  MyHome gallery field, and importing both would let the second `setValue()`
+  overwrite the first.
 - All batches return JSON `{success, data:{phase:'running'|'done'|'error', processed,
   total, offset}}`; UI shows `processed/total imported` + spinner (CSS must keep
   `.mes-spinner[hidden]{display:none}` or it spins forever).

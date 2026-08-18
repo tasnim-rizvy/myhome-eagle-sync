@@ -119,7 +119,6 @@ class Eagle_Field_Manager {
 
 			// Special -------------------------------------------------------
 			'gallery'                 => [ __( 'Gallery', 'myhome-eagle-sync' ), 'gallery' ],
-			'floorplans'              => [ __( 'Floorplans', 'myhome-eagle-sync' ), 'gallery' ],
 			'location'                => [ __( 'Location', 'myhome-eagle-sync' ), 'location' ],
 		];
 	}
@@ -167,8 +166,8 @@ class Eagle_Field_Manager {
 
 		$gallery = $this->first_match( $fields, static fn( array $f ) => 'gallery' === $f['type'] );
 		if ( $gallery ) {
-			$map['gallery']    = $gallery['id'];
-			$map['floorplans'] = $gallery['id'];
+			// Floorplans share this field but are deliberately not imported.
+			$map['gallery'] = $gallery['id'];
 		}
 
 		$location = $this->first_match( $fields, static fn( array $f ) => 'location' === $f['type'] );
@@ -177,7 +176,7 @@ class Eagle_Field_Manager {
 		}
 
 		foreach ( self::field_definitions() as $key => $definition ) {
-			if ( in_array( $key, [ 'gallery', 'floorplans', 'location' ], true ) ) {
+			if ( in_array( $key, [ 'gallery', 'location' ], true ) ) {
 				continue;
 			}
 

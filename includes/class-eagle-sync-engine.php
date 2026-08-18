@@ -367,10 +367,12 @@ class Eagle_Sync_Engine {
 			$errors[] = 'field write failed';
 		}
 
-		// Import galleries in bounded chunks; a large listing therefore spans
-		// several polls rather than one oversized request.
-		$gallery    = $this->write_gallery( $postId, $data['images'], 'gallery' );
-		$floorplans = $this->write_gallery( $postId, $data['floorplans'], 'floorplans' );
+		// Import the gallery in bounded chunks; a large listing therefore spans
+		// several polls rather than one oversized request. Only the API's
+		// "images" go into the gallery — floorplans are deliberately not
+		// imported (per project decision), otherwise the second setValue()
+		// would overwrite the first in the shared gallery field.
+		$gallery = $this->write_gallery( $postId, $data['images'], 'gallery' );
 
 		$this->write_agents( $postId, $data );
 		$this->write_custom_fields( $postId, $data );
@@ -382,9 +384,9 @@ class Eagle_Sync_Engine {
 
 		return $this->upsert_result(
 			$status,
-			$gallery['complete'] && $floorplans['complete'],
-			$gallery['done'] + $floorplans['done'],
-			$gallery['total'] + $floorplans['total']
+			$gallery['complete'],
+			$gallery['done'],
+			$gallery['total']
 		);
 	}
 
@@ -976,7 +978,6 @@ class Eagle_Sync_Engine {
 		}
 
 		$data['images']     = $node['images'] ?? [];
-		$data['floorplans'] = $node['floorplans'] ?? [];
 		$data['customFields'] = $node['customFields'] ?? [];
 		$data['office']     = $node['office'] ?? '';
 
