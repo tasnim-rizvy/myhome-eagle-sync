@@ -58,19 +58,36 @@ already exist on the site. No fields are ever auto-created.
   server and PHP's own timer doesn't count download wait (memory is a non-issue:
   `memory_limit` is 1536M). Fixed on two axes:
   1. **Resume per image.** The engine keeps `offset` on a listing until every
-     image is imported or exhausted; the 300 ms poll loop drives it. Dedup key =
-     eagle image id, else `url:<md5>` (stored in `_mes_eagle_image_id`). A
-     per-listing attempt counter (`_mes_eagle_image_attempts`, max
-     `mes_max_image_attempts` [3]) stops a broken URL from wedging the listing.
+     image is imported or exhausted; the 1s poll loop drives it. Dedup key =
+     eagle image id, else `url:<md5>` (stored in `_mes_eagle_image_id`).
+     **Images are never skipped**: a failed download is retried on the next
+     poll until it succeeds, so a listing stays pending until its gallery is
+     complete (failures are visible in the log as repeated download errors).
   2. **Time-boxed streaming downloads** (`stream_download_image`): each request
      pulls only a slice, and a large image is continued across polls with an
      HTTP Range request. curl's timeout is capped to the slice, so no request
      ever runs long enough to be killed. Partial files live in
      `uploads/mes-tmp/<md5>.part` until complete, then sideload.
-  Budgets are filters: `mes_images_per_request` [4], `mes_bytes_per_request`
-  [20 MB], `mes_request_time_budget` [20s], `mes_max_image_attempts` [3].
+  3. **Downscale before sideload** (`downscale_source_image`): the downloaded
+     source is resized to ≤2048px on its longest side before it is imported,
+     so WordPress's thumbnail generation works from a ~1MB image instead of a
+     4-6MB drone photo (~10x less resize CPU/memory). A 90-100MB listing then
+     streams across many short requests instead of one long one.
+  4. **Dedup key set early**: `_mes_eagle_image_id` is written immediately
+     after `wp_insert_attachment`, *before* `wp_generate_attachment_metadata`,
+     so a request killed mid-resize never re-downloads the same image; the
+     retry finds the orphan and regenerates its (missing) metadata in a
+     bounded step instead.
+  Budgets are filters: `mes_images_per_request` [1], `mes_bytes_per_request`
+  [20 MB], `mes_request_time_budget` [20s]. The `_mes_eagle_image_attempts`
+  counter is diagnostic only (failure counts per image, reset at each fresh
+  run) — it never skips an image.
   Fatal errors that bypass try/catch (OOM, PHP timeout) are now captured by a
   `register_shutdown_function` in `Eagle_Ajax` and written to the log.
+  Other smoothing: the busy lease is 60s (not 180s), the JS poll interval is
+  1s (not 300ms), and while a listing is stalled the engine reuses the last
+  fetched page from state instead of re-hitting the Eagle GraphQL API every
+  poll. `.part` files older than 24h are swept at the start of every fresh run.
 - `totalCount`-style pagination also affects the count walk: always `limit=50`.
 
 ## GraphQL query (what each listing node can contain)
@@ -133,7 +150,7 @@ The `status` key is deliberately never written as a field.
 ## Sync flow & state machine
 
 - Single AJAX action `mes_import_batch` (nonce, `set_time_limit(120)`). JS polls it
-  every 300 ms; each call = one batch (default **1** listing, filter
+  every 1000 ms; each call = one batch (default **1** listing, filter
   `mes_batch_size`, page capped at 50).
 - Options: `mes_sync_state` (phase/offset/total/processed/created/updated/skipped/
   failed/last_error/started_at), `mes_sync_summary` (finished totals), `mes_log`.

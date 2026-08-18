@@ -21,15 +21,13 @@ class Eagle_Sync_Engine {
 	// downloads or resizes more than these, so one image-heavy listing spans
 	// several polls instead of overrunning the proxy timeout or PHP memory
 	// limit (the cause of the 503s on ~100 MB listings).
-	private const DEFAULT_IMAGES_PER_REQUEST = 4;
+	private const DEFAULT_IMAGES_PER_REQUEST = 1;
 	private const DEFAULT_BYTES_PER_REQUEST  = 20971520; // 20 MB.
 	private const DEFAULT_TIME_BUDGET        = 20;        // Seconds of new work per request.
-	private const DEFAULT_MAX_IMAGE_ATTEMPTS = 3;
 
-	private int $request_deadline   = 0;
-	private int $images_remaining   = 0;
-	private int $bytes_remaining    = 0;
-	private int $max_image_attempts = 3;
+	private int $request_deadline = 0;
+	private int $images_remaining = 0;
+	private int $bytes_remaining  = 0;
 
 	// Eagle status => WP post status (keep everything visible per plan decision).
 	private const STATUS_MAP = [
@@ -81,10 +79,9 @@ class Eagle_Sync_Engine {
 
 		// Bound the work this request may do so it always finishes well within
 		// the server's request/memory limits, however small and unknown they are.
-		$this->request_deadline   = time() + max( 5, (int) apply_filters( 'mes_request_time_budget', self::DEFAULT_TIME_BUDGET ) );
-		$this->images_remaining   = max( 1, (int) apply_filters( 'mes_images_per_request', self::DEFAULT_IMAGES_PER_REQUEST ) );
-		$this->bytes_remaining    = max( 1048576, (int) apply_filters( 'mes_bytes_per_request', self::DEFAULT_BYTES_PER_REQUEST ) );
-		$this->max_image_attempts = max( 1, (int) apply_filters( 'mes_max_image_attempts', self::DEFAULT_MAX_IMAGE_ATTEMPTS ) );
+		$this->request_deadline = time() + max( 5, (int) apply_filters( 'mes_request_time_budget', self::DEFAULT_TIME_BUDGET ) );
+		$this->images_remaining = max( 1, (int) apply_filters( 'mes_images_per_request', self::DEFAULT_IMAGES_PER_REQUEST ) );
+		$this->bytes_remaining  = max( 1048576, (int) apply_filters( 'mes_bytes_per_request', self::DEFAULT_BYTES_PER_REQUEST ) );
 
 		// One batch at a time: if another request (e.g. a second tab or a
 		// poll overlapping a slow request) is still working, report current
@@ -124,17 +121,37 @@ class Eagle_Sync_Engine {
 				'started_at' => current_time( 'mysql' ),
 			];
 			Eagle_Logger::log( sprintf( 'Sync started (batch size %d), total listings: %d.', $batch, $counted ) );
+
+			// Sweep leftover partial downloads from runs that were killed
+			// (their images will simply be re-downloaded from scratch).
+			$this->cleanup_stale_parts();
+
+			// A fresh run restarts failure diagnostics: clear the per-image attempt
+			// counters (informational only — images are never skipped).
+			delete_metadata( 'post', null, self::IMAGE_ATTEMPTS_META, '', true );
 		}
 
 		// Mark this request as the active worker so overlapping requests
 		// report progress instead of importing the same batch twice. The lease
-		// outlives one bounded request (time budget + one in-flight image
-		// download, which can reach its 120s curl timeout) yet still frees on
-		// its own if the request is killed.
-		$state['busy_until'] = time() + 180;
+		// outlives one bounded request (time budget + one resize, which with a
+		// downscaled source is a few seconds) yet still frees on its own if
+		// the request is killed; 60s keeps a dead request from stalling the
+		// poll loop longer than necessary.
+		$state['busy_until'] = time() + 60;
 		self::set_state( $state );
 
-		$page = $this->client->fetch_properties_page( $batch, $state['offset'] );
+		// While a listing is stalled mid-gallery the offset does not advance,
+		// so reuse the previously fetched page instead of hitting the Eagle
+		// API again for the same node on every poll. The cache is keyed by
+		// offset and replaced whenever the offset moves.
+		$cached    = $state['current'] ?? null;
+		$useCache  = is_array( $cached )
+			&& (int) ( $cached['offset'] ?? -1 ) === (int) $state['offset']
+			&& is_array( $cached['nodes'] ?? null );
+
+		$page = $useCache
+			? [ 'totalCount' => (int) ( $cached['totalCount'] ?? 0 ), 'nodes' => $cached['nodes'] ]
+			: $this->client->fetch_properties_page( $batch, $state['offset'] );
 		if ( is_wp_error( $page ) ) {
 			$state['phase'] = 'error';
 			$state['last_error'] = $page->get_error_message();
@@ -144,6 +161,13 @@ class Eagle_Sync_Engine {
 		}
 
 		$state['total'] = max( $state['total'], (int) ( $page['totalCount'] ?? 0 ) );
+
+		// Keep the fetched page available for stalled polls (see above).
+		$state['current'] = [
+			'offset'     => (int) $state['offset'],
+			'totalCount' => (int) ( $page['totalCount'] ?? 0 ),
+			'nodes'      => $page['nodes'],
+		];
 
 		if ( empty( $page['nodes'] ) && 0 === $state['processed'] ) {
 			// Empty result right away: nothing to import.
@@ -535,19 +559,33 @@ class Eagle_Sync_Engine {
 			$existing = $this->find_attachment_by_key( $key );
 
 			if ( $existing ) {
-				$attachmentIds[] = $existing;
-				$done++;
-				continue;
+			// Reuse the attachment. If a previous request died mid-resize the
+			// dedup key already exists but the sizes are missing, so
+			// regenerate the metadata in a bounded step (the source is a
+			// downscaled image, so this is quick).
+			if ( ! get_post_meta( $existing, '_wp_attachment_metadata', true ) && time() < $this->request_deadline ) {
+				require_once ABSPATH . 'wp-admin/includes/image.php';
+				$file = get_attached_file( $existing );
+				if ( $file ) {
+					$this->maybe_raise_image_memory();
+					try {
+						$meta = wp_generate_attachment_metadata( $existing, $file );
+						wp_update_attachment_metadata( $existing, $meta );
+					} catch ( \Throwable $e ) {
+						Eagle_Logger::error( 'Metadata regen failed for attachment ' . $existing . ': ' . $e->getMessage() );
+					}
+				}
 			}
 
-			// Give up on images that have already failed too many times so a
-			// single broken URL can never block the listing forever; count them
-			// as resolved so the gallery can reach "complete".
-			if ( (int) ( $attempts[ $key ] ?? 0 ) >= $this->max_image_attempts ) {
-				$done++;
-				continue;
-			}
+			$attachmentIds[] = $existing;
+			$done++;
+			continue;
+		}
 
+				// No skipping: a failed image is retried on the next poll until it
+			// succeeds (the dedup key and Range resume make retries cheap).
+			// A permanently broken URL keeps the listing pending and shows up
+			// in the log as repeated download failures.
 			$pending[] = [ 'url' => $url, 'key' => $key ];
 		}
 
@@ -569,15 +607,21 @@ class Eagle_Sync_Engine {
 
 			if ( 'complete' === $res['status'] ) {
 				$this->maybe_raise_image_memory();
-				$attId = $this->insert_image_from_tmp( $image['url'], $res['tmp'], $postId );
+				$attId = $this->insert_image_from_tmp( $image['url'], $res['tmp'], $postId, $image['key'] );
 				if ( $attId ) {
-					update_post_meta( $attId, self::IMAGE_META, $image['key'] );
 					$attachmentIds[] = $attId;
 					$done++;
 					$this->images_remaining--;
 					unset( $attempts[ $image['key'] ] );
 				} else {
 					$attempts[ $image['key'] ] = (int) ( $attempts[ $image['key'] ] ?? 0 ) + 1;
+				}
+
+				// The insert includes a resize that cannot be interrupted;
+				// stop cleanly after it so the next poll continues with the
+				// remaining images.
+				if ( time() >= $this->request_deadline ) {
+					break;
 				}
 				continue;
 			}
@@ -796,12 +840,40 @@ class Eagle_Sync_Engine {
 	}
 
 	/**
-	 * Create an attachment from a downloaded temp file.
+	 * Delete partial downloads older than 24h. Called at the start of a fresh
+	 * run; a listing still being imported keeps its .part across polls, while
+	 * leftovers from killed runs are swept so they never accumulate.
 	 */
-	private function insert_image_from_tmp( string $url, string $tmp, int $postId ) {
+	private function cleanup_stale_parts(): void {
+		$dir = $this->partial_dir();
+		if ( '' === $dir ) {
+			return;
+		}
+
+		$cutoff = time() - DAY_IN_SECONDS;
+		foreach ( glob( $dir . '/*.part' ) ?: [] as $part ) {
+			if ( is_file( $part ) && filemtime( $part ) < $cutoff ) {
+				@unlink( $part );
+			}
+		}
+	}
+
+	/**
+	 * Create an attachment from a downloaded temp file.
+	 *
+	 * The source is downscaled to at most 2048px on its longest side before
+	 * sideloading, so WordPress's size generation works from a small image:
+	 * a 4-6MB drone photo becomes ~1MB, cutting resize CPU/memory by roughly
+	 * an order of magnitude and keeping every request inside the time budget.
+	 * The dedup key is stored immediately after the attachment row exists, so
+	 * a request killed mid-resize never re-downloads the same image.
+	 */
+	private function insert_image_from_tmp( string $url, string $tmp, int $postId, string $key ) {
 		require_once ABSPATH . 'wp-admin/includes/file.php';
 		require_once ABSPATH . 'wp-admin/includes/image.php';
 		require_once ABSPATH . 'wp-admin/includes/media.php';
+
+		$this->downscale_source_image( $tmp );
 
 		$file = [
 			'name'     => basename( $url ),
@@ -832,10 +904,38 @@ class Eagle_Sync_Engine {
 			return false;
 		}
 
+		// Dedup key first: even if the resize below is killed, the next poll
+		// finds this attachment and reuses it instead of re-downloading.
+		update_post_meta( $attId, self::IMAGE_META, $key );
+
 		$meta = wp_generate_attachment_metadata( $attId, $sideload['file'] );
 		wp_update_attachment_metadata( $attId, $meta );
 
 		return (int) $attId;
+	}
+
+	/**
+	 * Downscale a downloaded image file in place to at most 2048px on its
+	 * longest side. Leaves the file untouched when it is already small enough
+	 * or no image editor is available (resize then just costs a little more).
+	 */
+	private function downscale_source_image( string $tmp ): void {
+		$size = @getimagesize( $tmp );
+		if ( ! is_array( $size ) || ( (int) $size[0] <= 2048 && (int) $size[1] <= 2048 ) ) {
+			return;
+		}
+
+		$editor = wp_get_image_editor( $tmp );
+		if ( is_wp_error( $editor ) ) {
+			Eagle_Logger::error( 'Image editor unavailable for downscale: ' . $editor->get_error_message() );
+			return;
+		}
+
+		$editor->resize( 2048, 2048, false );
+		$saved = $editor->save( $tmp );
+		if ( is_wp_error( $saved ) ) {
+			Eagle_Logger::error( 'Downscale failed: ' . $saved->get_error_message() );
+		}
 	}
 
 	private function write_agents( int $postId, array $data ): void {

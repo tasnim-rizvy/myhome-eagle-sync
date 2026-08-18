@@ -38,7 +38,7 @@
 						}
 						setStatus(msg);
 						setSpinner(true);
-						setTimeout(step, 300);
+						setTimeout(step, 1000);
 					} else if (data.phase === 'done') {
 						setStatus(data.processed + '/' + data.processed + ' completed');
 						setSpinner(false);
