@@ -559,24 +559,8 @@ class Eagle_Sync_Engine {
 			$existing = $this->find_attachment_by_key( $key );
 
 			if ( $existing ) {
-			// Reuse the attachment. If a previous request died mid-resize the
-			// dedup key already exists but the sizes are missing, so
-			// regenerate the metadata in a bounded step (the source is a
-			// downscaled image, so this is quick).
-			if ( ! get_post_meta( $existing, '_wp_attachment_metadata', true ) && time() < $this->request_deadline ) {
-				require_once ABSPATH . 'wp-admin/includes/image.php';
-				$file = get_attached_file( $existing );
-				if ( $file ) {
-					$this->maybe_raise_image_memory();
-					try {
-						$meta = wp_generate_attachment_metadata( $existing, $file );
-						wp_update_attachment_metadata( $existing, $meta );
-					} catch ( \Throwable $e ) {
-						Eagle_Logger::error( 'Metadata regen failed for attachment ' . $existing . ': ' . $e->getMessage() );
-					}
-				}
-			}
-
+			// Reuse the attachment. No sizes are generated, so there is
+			// nothing to regenerate; the file itself is already in place.
 			$attachmentIds[] = $existing;
 			$done++;
 			continue;
@@ -861,19 +845,16 @@ class Eagle_Sync_Engine {
 	/**
 	 * Create an attachment from a downloaded temp file.
 	 *
-	 * The source is downscaled to at most 2048px on its longest side before
-	 * sideloading, so WordPress's size generation works from a small image:
-	 * a 4-6MB drone photo becomes ~1MB, cutting resize CPU/memory by roughly
-	 * an order of magnitude and keeping every request inside the time budget.
-	 * The dedup key is stored immediately after the attachment row exists, so
-	 * a request killed mid-resize never re-downloads the same image.
+	 * The original file is imported untouched — no downscaling and no
+	 * thumbnail-size generation (per project decision), so an import never
+	 * spends CPU/memory on image processing. Only minimal metadata (width,
+	 * height, path) is recorded so the media library stays functional. The
+	 * dedup key is stored immediately after the attachment row exists, so a
+	 * request killed mid-import never re-downloads the same image.
 	 */
 	private function insert_image_from_tmp( string $url, string $tmp, int $postId, string $key ) {
 		require_once ABSPATH . 'wp-admin/includes/file.php';
-		require_once ABSPATH . 'wp-admin/includes/image.php';
 		require_once ABSPATH . 'wp-admin/includes/media.php';
-
-		$this->downscale_source_image( $tmp );
 
 		$file = [
 			'name'     => basename( $url ),
@@ -904,38 +885,21 @@ class Eagle_Sync_Engine {
 			return false;
 		}
 
-		// Dedup key first: even if the resize below is killed, the next poll
+		// Dedup key first: even if the import below is killed, the next poll
 		// finds this attachment and reuses it instead of re-downloading.
 		update_post_meta( $attId, self::IMAGE_META, $key );
 
-		$meta = wp_generate_attachment_metadata( $attId, $sideload['file'] );
+		// Minimal metadata only: no sizes are generated, so this never
+		// touches an image editor and cannot be killed by resize work.
+		$dims = @getimagesize( $sideload['file'] );
+		$meta = [ 'file' => _wp_relative_upload_path( $sideload['file'] ) ];
+		if ( is_array( $dims ) ) {
+			$meta['width']  = $dims[0];
+			$meta['height'] = $dims[1];
+		}
 		wp_update_attachment_metadata( $attId, $meta );
 
 		return (int) $attId;
-	}
-
-	/**
-	 * Downscale a downloaded image file in place to at most 2048px on its
-	 * longest side. Leaves the file untouched when it is already small enough
-	 * or no image editor is available (resize then just costs a little more).
-	 */
-	private function downscale_source_image( string $tmp ): void {
-		$size = @getimagesize( $tmp );
-		if ( ! is_array( $size ) || ( (int) $size[0] <= 2048 && (int) $size[1] <= 2048 ) ) {
-			return;
-		}
-
-		$editor = wp_get_image_editor( $tmp );
-		if ( is_wp_error( $editor ) ) {
-			Eagle_Logger::error( 'Image editor unavailable for downscale: ' . $editor->get_error_message() );
-			return;
-		}
-
-		$editor->resize( 2048, 2048, false );
-		$saved = $editor->save( $tmp );
-		if ( is_wp_error( $saved ) ) {
-			Eagle_Logger::error( 'Downscale failed: ' . $saved->get_error_message() );
-		}
 	}
 
 	private function write_agents( int $postId, array $data ): void {

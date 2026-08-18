@@ -68,16 +68,14 @@ already exist on the site. No fields are ever auto-created.
      HTTP Range request. curl's timeout is capped to the slice, so no request
      ever runs long enough to be killed. Partial files live in
      `uploads/mes-tmp/<md5>.part` until complete, then sideload.
-  3. **Downscale before sideload** (`downscale_source_image`): the downloaded
-     source is resized to ≤2048px on its longest side before it is imported,
-     so WordPress's thumbnail generation works from a ~1MB image instead of a
-     4-6MB drone photo (~10x less resize CPU/memory). A 90-100MB listing then
-     streams across many short requests instead of one long one.
+  3. **No image processing** (project decision): the downloaded file is
+     sideloaded untouched — no downscaling, no WordPress thumbnail-size
+     generation, no image editor. Only minimal metadata (width/height/path)
+     is recorded. An import therefore never spends CPU/memory on resizing,
+     which is what used to get requests killed at ~180s on the live host.
   4. **Dedup key set early**: `_mes_eagle_image_id` is written immediately
-     after `wp_insert_attachment`, *before* `wp_generate_attachment_metadata`,
-     so a request killed mid-resize never re-downloads the same image; the
-     retry finds the orphan and regenerates its (missing) metadata in a
-     bounded step instead.
+     after `wp_insert_attachment`, so a request killed mid-import never
+     re-downloads the same image; the retry finds the orphan and reuses it.
   Budgets are filters: `mes_images_per_request` [1], `mes_bytes_per_request`
   [20 MB], `mes_request_time_budget` [20s]. The `_mes_eagle_image_attempts`
   counter is diagnostic only (failure counts per image, reset at each fresh
