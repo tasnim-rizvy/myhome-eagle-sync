@@ -38,7 +38,7 @@ class Eagle_Settings {
 		}
 
 		wp_enqueue_style( 'mes-sync', MES_PLUGIN_URL . 'assets/css/sync.css', [], MES_VERSION );
-		wp_enqueue_script( 'mes-sync', MES_PLUGIN_URL . 'assets/js/sync.js', [], MES_VERSION, true );
+		wp_enqueue_script( 'mes-sync', MES_PLUGIN_URL . 'assets/js/sync.js', [ 'jquery' ], MES_VERSION, true );
 		wp_localize_script(
 			'mes-sync',
 			'MES',
@@ -76,7 +76,7 @@ class Eagle_Settings {
 						</tr>
 						<tr>
 							<th scope="row"><label for="mes_client_secret"><?php esc_html_e( 'Client Secret', 'myhome-eagle-sync' ); ?></label></th>
-							<td><input type="password" class="regular-text" id="mes_client_secret" name="mes_client_secret" value="<?php echo esc_attr( $client->get_client_secret() ); ?>" autocomplete="new-password" /></td>
+					<td><input type="password" class="regular-text" id="mes_client_secret" name="mes_client_secret" value="" placeholder="<?php echo $hasKey ? esc_attr__( 'Saved — leave blank to keep it', 'myhome-eagle-sync' ) : ''; ?>" autocomplete="new-password" /></td>
 						</tr>
 					</table>
 					<?php submit_button( __( 'Save Keys', 'myhome-eagle-sync' ) ); ?>
@@ -121,6 +121,24 @@ class Eagle_Settings {
 
 	public function render_log(): void {
 		$log = Eagle_Logger::get_log();
+		$lines = [];
+		foreach ( $log as $entry ) {
+			if ( ! is_array( $entry ) ) {
+				$lines[] = (string) $entry;
+				continue;
+			}
+
+			$line = sprintf(
+				'[%s] %s: %s',
+				(string) ( $entry['time'] ?? '' ),
+				strtoupper( (string) ( $entry['level'] ?? 'log' ) ),
+				(string) ( $entry['msg'] ?? '' )
+			);
+			if ( array_key_exists( 'data', $entry ) ) {
+				$line .= "\n" . wp_json_encode( $entry['data'], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+			}
+			$lines[] = $line;
+		}
 		?>
 		<div class="wrap mes-wrap">
 			<h1><?php esc_html_e( 'Eagle Sync Log', 'myhome-eagle-sync' ); ?></h1>
@@ -128,7 +146,7 @@ class Eagle_Settings {
 				<?php if ( empty( $log ) ) : ?>
 					<p><?php esc_html_e( 'No log entries yet.', 'myhome-eagle-sync' ); ?></p>
 				<?php else : ?>
-					<pre class="mes-log"><?php echo esc_html( implode( "\n", $log ) ); ?></pre>
+					<pre class="mes-log"><?php echo esc_html( implode( "\n\n", $lines ) ); ?></pre>
 				<?php endif; ?>
 				<form method="post" action="">
 					<?php wp_nonce_field( 'mes_clear_log', 'mes_nonce' ); ?>
@@ -145,6 +163,10 @@ class Eagle_Settings {
 
 	public static function handle_post(): void {
 		if ( empty( $_POST['mes_nonce'] ) ) {
+			return;
+		}
+
+		if ( ! current_user_can( 'manage_options' ) ) {
 			return;
 		}
 

@@ -21,7 +21,7 @@ query SyncProperties($limit: Int!, $offset: Int!, $listingTypes: [ListingTypeEnu
       streetNo street unit municipality country lotNo latitude longitude
       price advertisedPrice showPrice saleOrLease listingType status propertyType
       daysOnMarket featured thumbnailSquare videoUrl onlineTour1Url onlineTour2Url
-      bookInspectionLink brochureTitle keyLocation keyNumber alarmCode smsCode internalNotes
+      bookInspectionLink brochureTitle
       agencyReference externalPropertyTree
       auctionDatetime listingExpiryDate letDate soldDate rentalDateAvailable
       soldPrice soldDisplay offMarketAt createdAt updatedAt activeAt withdrawnAt
@@ -31,7 +31,6 @@ query SyncProperties($limit: Int!, $offset: Int!, $listingTypes: [ListingTypeEnu
       floorplans { id position url }
       agents { id name title email phone mobile office { id name } }
       office { id name }
-      vendors { contact { id fullName company mobilePhone } }
       address { formattedFullAddress }
       listingDetails {
         ... on ResidentialSale { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes houseSizeUnits propertyType status establishedOrDevelopment energyEfficiencyRating }
@@ -78,6 +77,9 @@ GRAPHQL;
 		if ( $clientSecret !== '' ) {
 			update_option( MES_OPTION_CLIENT_SECRET, self::encrypt( $clientSecret ), false );
 		}
+
+		// Never keep a token issued for credentials that may just have changed.
+		delete_transient( MES_TRANSIENT_TOKEN );
 	}
 
 	// ---------------------------------------------------------------------
@@ -138,7 +140,7 @@ GRAPHQL;
 		$response = wp_remote_post(
 			self::TOKEN_URL,
 			[
-				'timeout' => 30,
+				'timeout' => 12,
 				'headers' => [
 					'Content-Type'  => 'application/json',
 					'Authorization' => 'Bearer ' . self::get_client_id() . ':' . self::get_client_secret(),
@@ -148,14 +150,38 @@ GRAPHQL;
 		);
 
 		if ( is_wp_error( $response ) ) {
-			return $response;
+			return new WP_Error(
+				'mes_token_transport',
+				'The site could not reach Eagle to obtain a token: ' . $response->get_error_message(),
+				[ 'retryable' => true, 'retry_after' => 2 ]
+			);
 		}
 
 		$status = wp_remote_retrieve_response_code( $response );
 		$body   = json_decode( wp_remote_retrieve_body( $response ), true );
 
+		if ( 429 === $status || $status >= 500 ) {
+			return new WP_Error(
+				'mes_token_unavailable',
+				sprintf( 'Eagle token service is temporarily unavailable (HTTP %d).', $status ),
+				[ 'retryable' => true, 'retry_after' => $this->retry_after( $response ) ]
+			);
+		}
+
+		if ( 200 === $status && ! is_array( $body ) ) {
+			return new WP_Error(
+				'mes_token_invalid_response',
+				'Eagle returned an invalid token response.',
+				[ 'retryable' => true, 'retry_after' => 2 ]
+			);
+		}
+
 		if ( 200 !== $status || empty( $body['data']['token']['token'] ) ) {
-			return new WP_Error( 'mes_token_failed', sprintf( 'Token request failed (HTTP %d). Check your credentials.', $status ) );
+			return new WP_Error(
+				'mes_token_failed',
+				sprintf( 'Token request failed (HTTP %d). Check your credentials.', $status ),
+				[ 'retryable' => false, 'status' => $status ]
+			);
 		}
 
 		$token      = $body['data']['token']['token'];
@@ -197,70 +223,87 @@ GRAPHQL;
 		}
 
 		$body = json_decode( wp_remote_retrieve_body( $response ), true );
+		if ( ! is_array( $body ) ) {
+			return new WP_Error(
+				'mes_invalid_json',
+				'Eagle returned an invalid JSON response.',
+				[ 'retryable' => true, 'retry_after' => 2 ]
+			);
+		}
 
 		if ( ! empty( $body['errors'] ) ) {
 			$message = is_array( $body['errors'] ) ? wp_json_encode( $body['errors'] ) : 'Unknown GraphQL error';
 			return new WP_Error( 'mes_graphql_error', $message );
 		}
 
+		if ( ! array_key_exists( 'data', $body ) || ! is_array( $body['data'] ) ) {
+			return new WP_Error(
+				'mes_missing_data',
+				'Eagle response did not contain GraphQL data.',
+				[ 'retryable' => true, 'retry_after' => 2 ]
+			);
+		}
+
 		return $body['data'] ?? [];
 	}
 
 	private function post_graphql( string $token, string $query, array $variables ) {
-		$attempts = 0;
+		$response = wp_remote_post(
+			self::GRAPHQL_URL,
+			[
+				// Keep one HTTP attempt bounded. The AJAX poll loop owns retries,
+				// which preserves the current listing checkpoint between attempts.
+				'timeout' => 12,
+				'headers' => [
+					'Content-Type'  => 'application/json',
+					'Authorization' => 'Bearer ' . $token,
+					'Origin'        => 'https://www.eagleagent.com.au',
+				],
+				'body'    => wp_json_encode(
+					[
+						'query'     => $query,
+						'variables' => $variables,
+					]
+				),
+			]
+		);
 
-		while ( $attempts < 2 ) {
-			$attempts++;
-
-			$response = wp_remote_post(
-				self::GRAPHQL_URL,
-				[
-					// The API answers in under a second when healthy; when it
-					// stalls it can ignore the timeout for minutes, so keep
-					// this short and let the next poll retry instead.
-					'timeout' => 30,
-					'headers' => [
-						'Content-Type'  => 'application/json',
-						'Authorization' => 'Bearer ' . $token,
-						'Origin'        => 'https://www.eagleagent.com.au',
-					],
-					'body'    => wp_json_encode(
-						[
-							'query'     => $query,
-							'variables' => $variables,
-						]
-					),
-				]
+		if ( is_wp_error( $response ) ) {
+			return new WP_Error(
+				'mes_graphql_transport',
+				'The site could not reach Eagle: ' . $response->get_error_message(),
+				[ 'retryable' => true, 'retry_after' => 2 ]
 			);
-
-			if ( is_wp_error( $response ) ) {
-				if ( $attempts < 2 ) {
-					sleep( 2 );
-					continue;
-				}
-				return $response;
-			}
-
-			$status = wp_remote_retrieve_response_code( $response );
-
-			if ( 429 === $status && $attempts < 2 ) {
-				sleep( 3 );
-				continue;
-			}
-
-			if ( 401 === $status ) {
-				return new WP_Error( 'mes_unauthorized', 'Unauthorized. Token may have expired.' );
-			}
-
-			if ( $status >= 500 && $attempts < 2 ) {
-				sleep( 3 );
-				continue;
-			}
-
-			return $response;
 		}
 
-		return new WP_Error( 'mes_http_failed', 'GraphQL request failed after retries.' );
+		$status = (int) wp_remote_retrieve_response_code( $response );
+
+		if ( 401 === $status ) {
+			return new WP_Error( 'mes_unauthorized', 'Unauthorized. Token may have expired.' );
+		}
+
+		if ( $status < 200 || $status >= 300 ) {
+			$retryable = 429 === $status || $status >= 500;
+			return new WP_Error(
+				'mes_http_failed',
+				sprintf( 'Eagle GraphQL request failed (HTTP %d).', $status ),
+				[
+					'status'      => $status,
+					'retryable'   => $retryable,
+					'retry_after' => $retryable ? $this->retry_after( $response ) : 0,
+				]
+			);
+		}
+
+		return $response;
+	}
+
+	/**
+	 * Bounded Retry-After value from an Eagle HTTP response.
+	 */
+	private function retry_after( $response ): int {
+		$value = wp_remote_retrieve_header( $response, 'retry-after' );
+		return is_numeric( $value ) ? max( 1, min( 30, (int) $value ) ) : 2;
 	}
 
 	// ---------------------------------------------------------------------
@@ -288,6 +331,9 @@ GRAPHQL;
 		}
 
 		$props = $data['properties'] ?? [];
+		if ( ! is_array( $props ) || ! isset( $props['nodes'] ) || ! is_array( $props['nodes'] ) ) {
+			return new WP_Error( 'mes_invalid_properties', 'Eagle response did not contain a valid properties page.' );
+		}
 
 		return [
 			'totalCount' => (int) ( $props['totalCount'] ?? 0 ),

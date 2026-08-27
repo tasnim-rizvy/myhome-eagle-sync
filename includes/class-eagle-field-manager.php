@@ -14,6 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Eagle_Field_Manager {
 
 	public const DEFAULT_CURRENCY = 'AUD';
+	private const FIELD_MAP_CACHE = 'mes_eagle_field_map_v2';
 
 	/**
 	 * Eagle keys whose name differs from the MyHome field slug.
@@ -80,11 +81,6 @@ class Eagle_Field_Manager {
 
 			// Text ----------------------------------------------------------
 			'agencyReference'         => [ __( 'Agency Reference', 'myhome-eagle-sync' ), 'text' ],
-			'keyLocation'             => [ __( 'Key Location', 'myhome-eagle-sync' ), 'text' ],
-			'keyNumber'               => [ __( 'Key Number', 'myhome-eagle-sync' ), 'text' ],
-			'alarmCode'               => [ __( 'Alarm Code', 'myhome-eagle-sync' ), 'text' ],
-			'smsCode'                 => [ __( 'SMS Code', 'myhome-eagle-sync' ), 'text' ],
-			'internalNotes'           => [ __( 'Internal Notes', 'myhome-eagle-sync' ), 'text' ],
 			'brochureTitle'           => [ __( 'Brochure Title', 'myhome-eagle-sync' ), 'text' ],
 			'externalPropertyTree'    => [ __( 'External Property Tree', 'myhome-eagle-sync' ), 'text' ],
 			'energyEfficiencyRating'  => [ __( 'Energy Efficiency Rating', 'myhome-eagle-sync' ), 'text' ],
@@ -119,6 +115,7 @@ class Eagle_Field_Manager {
 
 			// Special -------------------------------------------------------
 			'gallery'                 => [ __( 'Gallery', 'myhome-eagle-sync' ), 'gallery' ],
+			'floorplans'              => [ __( 'Floorplans', 'myhome-eagle-sync' ), 'gallery' ],
 			'location'                => [ __( 'Location', 'myhome-eagle-sync' ), 'location' ],
 		];
 	}
@@ -142,9 +139,16 @@ class Eagle_Field_Manager {
 			return $cached;
 		}
 
+		$persistent = get_transient( self::FIELD_MAP_CACHE );
+		if ( is_array( $persistent ) ) {
+			return $cached = $persistent;
+		}
+
 		$fields = $this->existing_fields();
 		if ( empty( $fields ) ) {
-			return $cached = [];
+			$cached = [];
+			set_transient( self::FIELD_MAP_CACHE, $cached, HOUR_IN_SECONDS );
+			return $cached;
 		}
 
 		$usage = $this->usage_ranking( $fields );
@@ -166,8 +170,8 @@ class Eagle_Field_Manager {
 
 		$gallery = $this->first_match( $fields, static fn( array $f ) => 'gallery' === $f['type'] );
 		if ( $gallery ) {
-			// Floorplans share this field but are deliberately not imported.
-			$map['gallery'] = $gallery['id'];
+			$map['gallery']    = $gallery['id'];
+			$map['floorplans'] = $gallery['id'];
 		}
 
 		$location = $this->first_match( $fields, static fn( array $f ) => 'location' === $f['type'] );
@@ -176,7 +180,7 @@ class Eagle_Field_Manager {
 		}
 
 		foreach ( self::field_definitions() as $key => $definition ) {
-			if ( in_array( $key, [ 'gallery', 'location' ], true ) ) {
+			if ( in_array( $key, [ 'gallery', 'floorplans', 'location' ], true ) ) {
 				continue;
 			}
 
@@ -198,7 +202,9 @@ class Eagle_Field_Manager {
 			}
 		}
 
-		return $cached = $map;
+		$cached = $map;
+		set_transient( self::FIELD_MAP_CACHE, $cached, 6 * HOUR_IN_SECONDS );
+		return $cached;
 	}
 
 	public function get_field_id( string $key ): int {

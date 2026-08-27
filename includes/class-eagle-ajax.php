@@ -5,43 +5,120 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 class Eagle_Ajax {
+	private const WORKER_LOCK_OPTION = 'mes_eagle_sync_worker_lock';
 
 	public function __construct() {
 		add_action( 'wp_ajax_mes_import_batch', [ $this, 'import_batch' ] );
 	}
 
 	private function guard(): void {
-		check_ajax_referer( 'mes_ajax', 'nonce' );
+		if ( ! check_ajax_referer( 'mes_ajax', 'nonce', false ) ) {
+			wp_send_json_error( [ 'message' => __( 'Your session expired. Refresh this page and try again.', 'myhome-eagle-sync' ) ], 403 );
+		}
 		if ( ! current_user_can( 'manage_options' ) ) {
 			wp_send_json_error( [ 'message' => __( 'Permission denied.', 'myhome-eagle-sync' ) ], 403 );
 		}
 	}
 
 	public function import_batch(): void {
-		$this->install_fatal_watch();
-
 		if ( function_exists( 'set_time_limit' ) ) {
-			// Image downloads are bandwidth-bound (S3 throttles to ~140 KB/s
-			// per connection); parallel downloads with 120s per-image timeouts
-			// need a generous budget.
-			@set_time_limit( 300 );
+			// Each request is deliberately small. A shorter PHP ceiling prevents a
+			// thumbnail operation from waiting for the host's ~180-second cutoff.
+			@set_time_limit( 60 );
 		}
 
-		try {
-			$this->guard();
+		$this->guard();
 
+		$owner = wp_generate_uuid4();
+		if ( ! $this->acquire_worker_lock( $owner ) ) {
+			$state = Eagle_Sync_Engine::get_state();
+			wp_send_json_success(
+				[
+					'phase'        => 'running',
+					'retry_after'  => 2,
+					'processed'    => (int) ( $state['processed'] ?? 0 ),
+					'total'        => (int) ( $state['total'] ?? 0 ),
+					'offset'       => (int) ( $state['offset'] ?? 0 ),
+					'images_done'  => (int) ( $state['current_images_done'] ?? 0 ),
+					'images_total' => (int) ( $state['current_images_total'] ?? 0 ),
+				]
+			);
+		}
+
+		$this->install_fatal_watch( $owner );
+		$result      = null;
+		$error       = '';
+		$errorStatus = 500;
+
+		try {
 			$engine = new Eagle_Sync_Engine();
 			$result = $engine->process_batch();
 
 			if ( 'error' === $result['phase'] ) {
-				Eagle_Logger::error( (string) ( $result['message'] ?? 'Unknown sync error.' ) );
-				wp_send_json_error( [ 'message' => $result['message'] ?? __( 'Unknown sync error.', 'myhome-eagle-sync' ) ] );
+				$error       = (string) ( $result['message'] ?? __( 'Unknown sync error.', 'myhome-eagle-sync' ) );
+				$errorStatus = 400;
+				Eagle_Logger::error( $error );
 			}
-
-			wp_send_json_success( $result );
 		} catch ( Throwable $e ) {
-			Eagle_Logger::error( 'Batch crashed: ' . $e->getMessage() );
-			wp_send_json_error( [ 'message' => 'Batch crashed: ' . $e->getMessage() ] );
+			$state = Eagle_Sync_Engine::get_state();
+			unset( $state['busy_until'] );
+			Eagle_Sync_Engine::set_state( $state );
+			$error = 'Batch crashed: ' . $e->getMessage();
+			Eagle_Logger::error( $error );
+		}
+
+		self::release_worker_lock( $owner );
+
+		if ( '' !== $error ) {
+			wp_send_json_error( [ 'message' => $error ], $errorStatus );
+		}
+
+		wp_send_json_success( $result );
+	}
+
+	/**
+	 * Atomic cross-request lock. A stale lock expires automatically if PHP is
+	 * terminated before the shutdown handler can release it.
+	 */
+	private function acquire_worker_lock( string $owner ): bool {
+		$expires = time() + 90;
+		$value   = $expires . '|' . $owner;
+
+		if ( add_option( self::WORKER_LOCK_OPTION, $value, '', false ) ) {
+			return true;
+		}
+
+		$existing = (string) get_option( self::WORKER_LOCK_OPTION, '' );
+		$parts    = explode( '|', $existing, 2 );
+		if ( (int) ( $parts[0] ?? 0 ) > time() ) {
+			return false;
+		}
+
+		// Replace only the exact stale value we observed. This compare-and-swap
+		// prevents two tabs from both deleting/recreating the same expired option.
+		global $wpdb;
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+				$value,
+				self::WORKER_LOCK_OPTION,
+				$existing
+			)
+		);
+
+		if ( 1 === (int) $updated ) {
+			wp_cache_delete( self::WORKER_LOCK_OPTION, 'options' );
+			return true;
+		}
+
+		return false;
+	}
+
+	private static function release_worker_lock( string $owner ): void {
+		$lock  = (string) get_option( self::WORKER_LOCK_OPTION, '' );
+		$parts = explode( '|', $lock, 2 );
+		if ( isset( $parts[1] ) && hash_equals( $parts[1], $owner ) ) {
+			delete_option( self::WORKER_LOCK_OPTION );
 		}
 	}
 
@@ -59,12 +136,12 @@ class Eagle_Ajax {
 	 * whether requests are being cut at a fixed wall-clock (a proxy/host limit)
 	 * rather than dying inside PHP.
 	 */
-	private function install_fatal_watch(): void {
+	private function install_fatal_watch( string $owner ): void {
 		$GLOBALS['mes_mem_reserve'] = str_repeat( ' ', 1048576 ); // ~1 MB, freed on shutdown.
 		$started = microtime( true );
 
 		register_shutdown_function(
-			static function () use ( $started ) {
+			static function () use ( $started, $owner ) {
 				unset( $GLOBALS['mes_mem_reserve'] );
 
 				$elapsed = round( microtime( true ) - $started, 1 );
@@ -74,6 +151,13 @@ class Eagle_Ajax {
 				$fatal   = $err && in_array( $err['type'], [ E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR ], true );
 
 				if ( $fatal ) {
+					self::release_worker_lock( $owner );
+					// A killed request cannot release its normal lease. Clear it here so
+					// the browser can resume immediately instead of waiting for expiry.
+					$state = Eagle_Sync_Engine::get_state();
+					unset( $state['busy_until'] );
+					Eagle_Sync_Engine::set_state( $state );
+
 					$msg = sprintf(
 						'FATAL in batch: %s (%s:%d) | peak memory %s of %s | %ss elapsed',
 						$err['message'],
@@ -88,14 +172,16 @@ class Eagle_Ajax {
 					return;
 				}
 
-				error_log(
-					sprintf(
-						'[myhome-eagle-sync] batch end: peak memory %s of %s | %ss elapsed',
-						size_format( $peak ),
-						$limit,
-						$elapsed
-					)
-				);
+				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+					error_log(
+						sprintf(
+							'[myhome-eagle-sync] batch end: peak memory %s of %s | %ss elapsed',
+							size_format( $peak ),
+							$limit,
+							$elapsed
+						)
+					);
+				}
 			}
 		);
 	}

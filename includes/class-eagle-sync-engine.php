@@ -16,6 +16,8 @@ class Eagle_Sync_Engine {
 	public const OFFICE_META = '_mes_eagle_office';
 	public const CUSTOM_FIELDS_META = '_mes_eagle_custom_fields';
 	public const IMAGE_ATTEMPTS_META = '_mes_eagle_image_attempts';
+	public const IMAGE_ATTEMPTS_VERSION_META = '_mes_eagle_image_attempts_version';
+	public const DATA_VERSION_META = '_mes_eagle_data_version';
 
 	// Per-request work budgets (all filterable). A single HTTP request never
 	// downloads or resizes more than these, so one image-heavy listing spans
@@ -24,10 +26,13 @@ class Eagle_Sync_Engine {
 	private const DEFAULT_IMAGES_PER_REQUEST = 1;
 	private const DEFAULT_BYTES_PER_REQUEST  = 20971520; // 20 MB.
 	private const DEFAULT_TIME_BUDGET        = 20;        // Seconds of new work per request.
+	private const DEFAULT_MAX_IMAGE_ATTEMPTS = 3;
+	private const IMAGE_ATTEMPTS_VERSION     = '2';
 
-	private int $request_deadline = 0;
-	private int $images_remaining = 0;
-	private int $bytes_remaining  = 0;
+	private int $request_deadline   = 0;
+	private int $images_remaining   = 0;
+	private int $bytes_remaining    = 0;
+	private int $max_image_attempts = 3;
 
 	// Eagle status => WP post status (keep everything visible per plan decision).
 	private const STATUS_MAP = [
@@ -79,9 +84,10 @@ class Eagle_Sync_Engine {
 
 		// Bound the work this request may do so it always finishes well within
 		// the server's request/memory limits, however small and unknown they are.
-		$this->request_deadline = time() + max( 5, (int) apply_filters( 'mes_request_time_budget', self::DEFAULT_TIME_BUDGET ) );
-		$this->images_remaining = max( 1, (int) apply_filters( 'mes_images_per_request', self::DEFAULT_IMAGES_PER_REQUEST ) );
-		$this->bytes_remaining  = max( 1048576, (int) apply_filters( 'mes_bytes_per_request', self::DEFAULT_BYTES_PER_REQUEST ) );
+		$this->request_deadline   = time() + max( 5, (int) apply_filters( 'mes_request_time_budget', self::DEFAULT_TIME_BUDGET ) );
+		$this->images_remaining   = max( 1, (int) apply_filters( 'mes_images_per_request', self::DEFAULT_IMAGES_PER_REQUEST ) );
+		$this->bytes_remaining    = max( 1048576, (int) apply_filters( 'mes_bytes_per_request', self::DEFAULT_BYTES_PER_REQUEST ) );
+		$this->max_image_attempts = max( 1, (int) apply_filters( 'mes_max_image_attempts', self::DEFAULT_MAX_IMAGE_ATTEMPTS ) );
 
 		// One batch at a time: if another request (e.g. a second tab or a
 		// poll overlapping a slow request) is still working, report current
@@ -89,6 +95,7 @@ class Eagle_Sync_Engine {
 		if ( 'running' === ( $state['phase'] ?? '' ) && (int) ( $state['busy_until'] ?? 0 ) > time() ) {
 			return [
 				'phase'        => 'running',
+				'retry_after'  => 2,
 				'processed'    => (int) ( $state['processed'] ?? 0 ),
 				'total'        => (int) ( $state['total'] ?? 0 ),
 				'offset'       => (int) ( $state['offset'] ?? 0 ),
@@ -98,15 +105,12 @@ class Eagle_Sync_Engine {
 		}
 
 		if ( empty( $state['phase'] ) || 'running' !== $state['phase'] ) {
-			// Start a fresh run; seed the total with an exact API count so the
-			// progress can be shown as "processed/total" from the first batch.
+			// Start immediately. A separate pre-count doubled API work and could
+			// exhaust the host timeout before the first listing was checkpointed.
+			// The first real page supplies totalCount; the previous run is only a
+			// temporary progress estimate until then.
 			$last = get_option( MES_OPTION_SYNC_SUMMARY, [] );
-
-			$counted = $this->client->count_properties();
-			if ( 0 === $counted ) {
-				// Count failed; fall back to the previous run's count.
-				$counted = (int) ( is_array( $last ) ? ( $last['processed'] ?? 0 ) : 0 );
-			}
+			$counted = (int) ( is_array( $last ) ? ( $last['processed'] ?? 0 ) : 0 );
 
 			$state = [
 				'phase'      => 'running',
@@ -121,53 +125,47 @@ class Eagle_Sync_Engine {
 				'started_at' => current_time( 'mysql' ),
 			];
 			Eagle_Logger::log( sprintf( 'Sync started (batch size %d), total listings: %d.', $batch, $counted ) );
-
-			// Sweep leftover partial downloads from runs that were killed
-			// (their images will simply be re-downloaded from scratch).
-			$this->cleanup_stale_parts();
-
-			// A fresh run restarts failure diagnostics: clear the per-image attempt
-			// counters (informational only — images are never skipped).
-			delete_metadata( 'post', null, self::IMAGE_ATTEMPTS_META, '', true );
 		}
 
 		// Mark this request as the active worker so overlapping requests
 		// report progress instead of importing the same batch twice. The lease
-		// outlives one bounded request (time budget + one resize, which with a
-		// downscaled source is a few seconds) yet still frees on its own if
-		// the request is killed; 60s keeps a dead request from stalling the
-		// poll loop longer than necessary.
-		$state['busy_until'] = time() + 60;
+		// outlives one bounded request and still frees on its own if the request
+		// is killed before its normal cleanup path.
+		$state['busy_until'] = time() + 75;
 		self::set_state( $state );
 
-		// While a listing is stalled mid-gallery the offset does not advance,
-		// so reuse the previously fetched page instead of hitting the Eagle
-		// API again for the same node on every poll. The cache is keyed by
-		// offset and replaced whenever the offset moves.
-		$cached    = $state['current'] ?? null;
-		$useCache  = is_array( $cached )
-			&& (int) ( $cached['offset'] ?? -1 ) === (int) $state['offset']
-			&& is_array( $cached['nodes'] ?? null );
-
-		$page = $useCache
-			? [ 'totalCount' => (int) ( $cached['totalCount'] ?? 0 ), 'nodes' => $cached['nodes'] ]
-			: $this->client->fetch_properties_page( $batch, $state['offset'] );
+		$page = $this->client->fetch_properties_page( $batch, $state['offset'] );
 		if ( is_wp_error( $page ) ) {
-			$state['phase'] = 'error';
 			$state['last_error'] = $page->get_error_message();
+			$errorData = $page->get_error_data();
+			$retryable = is_array( $errorData ) && ! empty( $errorData['retryable'] );
+			$failures  = (int) ( $state['consecutive_failures'] ?? 0 ) + 1;
 			unset( $state['busy_until'] );
+
+			if ( $retryable && $failures <= 6 ) {
+				$retryAfter = max( 1, min( 30, (int) ( $errorData['retry_after'] ?? ( 2 ** min( $failures, 4 ) ) ) ) );
+				$state['consecutive_failures'] = $failures;
+				self::set_state( $state );
+				Eagle_Logger::error( 'Temporary Eagle API error; checkpoint retained: ' . $state['last_error'] );
+
+				return [
+					'phase'       => 'running',
+					'message'     => 'Eagle is temporarily unavailable. Retrying without losing progress…',
+					'retry_after' => $retryAfter,
+					'processed'   => (int) ( $state['processed'] ?? 0 ),
+					'total'       => (int) ( $state['total'] ?? 0 ),
+					'offset'      => (int) ( $state['offset'] ?? 0 ),
+				];
+			}
+
+			$state['phase'] = 'error';
 			self::set_state( $state );
 			return [ 'phase' => 'error', 'message' => $state['last_error'] ];
 		}
 
-		$state['total'] = max( $state['total'], (int) ( $page['totalCount'] ?? 0 ) );
+		unset( $state['consecutive_failures'] );
 
-		// Keep the fetched page available for stalled polls (see above).
-		$state['current'] = [
-			'offset'     => (int) $state['offset'],
-			'totalCount' => (int) ( $page['totalCount'] ?? 0 ),
-			'nodes'      => $page['nodes'],
-		];
+		$state['total'] = max( $state['total'], (int) ( $page['totalCount'] ?? 0 ) );
 
 		if ( empty( $page['nodes'] ) && 0 === $state['processed'] ) {
 			// Empty result right away: nothing to import.
@@ -325,6 +323,23 @@ class Eagle_Sync_Engine {
 		);
 
 		$postId = ! empty( $existing ) ? (int) $existing[0] : 0;
+		$sourceVersion = (string) ( $data['updatedAt'] ?? '' );
+		if ( '' === $sourceVersion ) {
+			$sourceVersion = hash(
+				'sha256',
+				wp_json_encode(
+					[
+						'id'          => $propertyId,
+						'status'      => $data['status'] ?? '',
+						'headline'    => $data['headline'] ?? '',
+						'description' => $data['description'] ?? '',
+						'price'       => $data['price'] ?? '',
+					]
+				)
+			);
+		}
+		$dataVersion = MES_VERSION . ':' . $sourceVersion;
+		$dataCurrent = $postId > 0 && hash_equals( (string) get_post_meta( $postId, self::DATA_VERSION_META, true ), $dataVersion );
 
 		// Unique slug: {address}-{eagle id} so the permalink ends with the
 		// API id, e.g. /listing/21-mcguigan-drive-1741646/.
@@ -346,7 +361,7 @@ class Eagle_Sync_Engine {
 			}
 			update_post_meta( $postId, self::PROPERTY_META, $propertyId );
 			$created = true;
-		} else {
+		} elseif ( ! $dataCurrent ) {
 			wp_update_post(
 				[
 					'ID'          => $postId,
@@ -356,26 +371,41 @@ class Eagle_Sync_Engine {
 				]
 			);
 			$created = false;
+		} else {
+			$created = false;
 		}
-
-		// Raw status for the "flag" (visible in admin and useful for filters).
-		update_post_meta( $postId, self::STATUS_META, (string) ( $data['status'] ?? '' ) );
 
 		$errors = [];
 
-		if ( ! $this->write_fields( $postId, $data ) ) {
-			$errors[] = 'field write failed';
+		if ( ! $dataCurrent ) {
+			// These save hooks can be expensive on MyHome. Run them once per Eagle
+			// updatedAt value; media-only polls below then do only media work.
+			update_post_meta( $postId, self::STATUS_META, (string) ( $data['status'] ?? '' ) );
+
+			if ( ! $this->write_fields( $postId, $data ) ) {
+				$errors[] = 'field write failed';
+			}
+
+			$this->write_agents( $postId, $data );
+			$this->write_custom_fields( $postId, $data );
+			update_post_meta( $postId, self::DATA_VERSION_META, $dataVersion );
 		}
 
-		// Import the gallery in bounded chunks; a large listing therefore spans
-		// several polls rather than one oversized request. Only the API's
-		// "images" go into the gallery — floorplans are deliberately not
-		// imported (per project decision), otherwise the second setValue()
-		// would overwrite the first in the shared gallery field.
-		$gallery = $this->write_gallery( $postId, $data['images'], 'gallery' );
-
-		$this->write_agents( $postId, $data );
-		$this->write_custom_fields( $postId, $data );
+		// Import galleries in bounded chunks; a large listing therefore spans
+		// several polls rather than one oversized request. MyHome installations
+		// commonly expose one gallery field for both photos and floorplans. Write
+		// it once when both keys map to that field, otherwise the second setter
+		// overwrites the first gallery.
+		$galleryFieldId    = $this->fields->get_field_id( 'gallery' );
+		$floorplansFieldId = $this->fields->get_field_id( 'floorplans' );
+		if ( $galleryFieldId > 0 && $galleryFieldId === $floorplansFieldId ) {
+			$combined   = array_values( array_merge( $data['images'], $data['floorplans'] ) );
+			$gallery    = $this->write_gallery( $postId, $combined, 'gallery' );
+			$floorplans = [ 'complete' => true, 'done' => 0, 'total' => 0 ];
+		} else {
+			$gallery    = $this->write_gallery( $postId, $data['images'], 'gallery' );
+			$floorplans = $this->write_gallery( $postId, $data['floorplans'], 'floorplans' );
+		}
 
 		$status = $created ? 'created' : 'updated';
 		if ( ! empty( $errors ) ) {
@@ -384,9 +414,9 @@ class Eagle_Sync_Engine {
 
 		return $this->upsert_result(
 			$status,
-			$gallery['complete'],
-			$gallery['done'],
-			$gallery['total']
+			$gallery['complete'] && $floorplans['complete'],
+			$gallery['done'] + $floorplans['done'],
+			$gallery['total'] + $floorplans['total']
 		);
 	}
 
@@ -408,15 +438,26 @@ class Eagle_Sync_Engine {
 
 	private function write_fields( int $postId, array $data ): bool {
 		$map = $this->fields->get_field_map();
+		$success = true;
 
 		foreach ( $map as $key => $fieldId ) {
+			// These structured values are handled by write_gallery(), not by the
+			// generic scalar field path below.
+			if ( in_array( $key, [ 'gallery', 'floorplans' ], true ) ) {
+				continue;
+			}
+
 			if ( ! isset( $data[ $key ] ) || $data[ $key ] === null || $data[ $key ] === '' ) {
 				continue;
 			}
 
 			try {
 				$field = tdf_field_factory()->create( $fieldId );
-			} catch ( Exception $e ) {
+			} catch ( Throwable $e ) {
+				$success = false;
+				Eagle_Logger::error(
+					sprintf( 'Field creation failed for %s on listing %d: %s', $key, $postId, $e->getMessage() )
+				);
 				continue;
 			}
 
@@ -426,53 +467,60 @@ class Eagle_Sync_Engine {
 
 			$value = $data[ $key ];
 
-			switch ( $field->getType() ) {
-				case 'price':
-					$field->setValue( $this->listing_model( $postId ), $this->price_value( $value, $fieldId ) );
-					break;
+			try {
+				switch ( $field->getType() ) {
+					case 'price':
+						$field->setValue( $this->listing_model( $postId ), $this->price_value( $value, $fieldId ) );
+						break;
 
-				case 'number':
-					$field->setValue( $this->listing_model( $postId ), (string) (float) $value );
-					break;
+					case 'number':
+						$field->setValue( $this->listing_model( $postId ), (string) (float) $value );
+						break;
 
-				case 'location':
-					$field->setValue(
-						$this->listing_model( $postId ),
-						[
-							'lat'     => (string) ( $value['lat'] ?? '' ),
-							'lng'     => (string) ( $value['lng'] ?? '' ),
-							'address' => (string) ( $value['address'] ?? '' ),
-						]
-					);
-					break;
+					case 'location':
+						$field->setValue(
+							$this->listing_model( $postId ),
+							[
+								'lat'     => (string) ( $value['lat'] ?? '' ),
+								'lng'     => (string) ( $value['lng'] ?? '' ),
+								'address' => (string) ( $value['address'] ?? '' ),
+							]
+						);
+						break;
 
-				case 'embed':
-					// MyHome only renders the "embed" key (oEmbed HTML) both in
-					// the admin preview and on the frontend; a bare URL is not
-					// enough, so resolve it via wp_oembed_get().
-					$embed = is_scalar( $value ) ? (string) $value : '';
-					$field->setValue(
-						$this->listing_model( $postId ),
-						[
-							'url'   => $embed,
-							'embed' => $embed !== '' ? (string) wp_oembed_get( $embed ) : '',
-						]
-					);
-					break;
+					case 'embed':
+						// MyHome only renders the "embed" key (oEmbed HTML) both in
+						// the admin preview and on the frontend; a bare URL is not
+						// enough, so resolve it via wp_oembed_get().
+						$embed = is_scalar( $value ) ? (string) $value : '';
+						$field->setValue(
+							$this->listing_model( $postId ),
+							[
+								'url'   => $embed,
+								'embed' => $embed !== '' ? (string) wp_oembed_get( $embed ) : '',
+							]
+						);
+						break;
 
-				case 'taxonomy':
-					$termIds = $this->ensure_terms( (string) $field->getKey(), $value );
-					if ( ! empty( $termIds ) ) {
-						$field->setValue( $this->listing_model( $postId ), $termIds );
-					}
-					break;
+					case 'taxonomy':
+						$termIds = $this->ensure_terms( (string) $field->getKey(), $value );
+						if ( ! empty( $termIds ) ) {
+							$field->setValue( $this->listing_model( $postId ), $termIds );
+						}
+						break;
 
-				default:
-					$field->setValue( $this->listing_model( $postId ), is_scalar( $value ) ? (string) $value : wp_json_encode( $value ) );
+					default:
+						$field->setValue( $this->listing_model( $postId ), is_scalar( $value ) ? (string) $value : wp_json_encode( $value ) );
+				}
+			} catch ( Throwable $e ) {
+				$success = false;
+				Eagle_Logger::error(
+					sprintf( 'Field write failed for %s on listing %d: %s', $key, $postId, $e->getMessage() )
+				);
 			}
 		}
 
-		return true;
+		return $success;
 	}
 
 	/**
@@ -540,45 +588,68 @@ class Eagle_Sync_Engine {
 			return [ 'complete' => true, 'done' => 0, 'total' => 0 ];
 		}
 
-		$attempts = get_post_meta( $postId, self::IMAGE_ATTEMPTS_META, true );
-		if ( ! is_array( $attempts ) ) {
+		// Retry images that an older plugin build may have permanently marked as
+		// failed. This migration is lazy and runs only once per listing.
+		if ( self::IMAGE_ATTEMPTS_VERSION !== (string) get_post_meta( $postId, self::IMAGE_ATTEMPTS_VERSION_META, true ) ) {
 			$attempts = [];
+			delete_post_meta( $postId, self::IMAGE_ATTEMPTS_META );
+			update_post_meta( $postId, self::IMAGE_ATTEMPTS_VERSION_META, self::IMAGE_ATTEMPTS_VERSION );
+		} else {
+			$attempts = get_post_meta( $postId, self::IMAGE_ATTEMPTS_META, true );
+			if ( ! is_array( $attempts ) ) {
+				$attempts = [];
+			}
 		}
 
 		$total         = 0;
 		$done          = 0;
 		$attachmentIds = [];
 		$pending       = [];
+		$seen          = [];
 
 		foreach ( $images as $image ) {
 			$url = (string) ( $image['url'] ?? '' );
 			if ( $url === '' ) {
 				continue;
 			}
+			$key      = $this->image_dedup_key( $image );
+			if ( isset( $seen[ $key ] ) ) {
+				continue;
+			}
+			$seen[ $key ] = true;
 			$total++;
 
-			$key      = $this->image_dedup_key( $image );
-			$existing = $this->find_attachment_by_key( $key );
+			$existing = $this->find_attachment_by_key( $key, $url, $postId );
 
 			if ( $existing ) {
-			// Reuse the attachment. No sizes are generated, so there is
-			// nothing to regenerate; the file itself is already in place.
-			$attachmentIds[] = $existing;
-			$done++;
-			continue;
-		}
+				$attachmentIds[] = $existing;
+				$done++;
+				continue;
+			}
 
-				// No skipping: a failed image is retried on the next poll until it
-			// succeeds (the dedup key and Range resume make retries cheap).
-			// A permanently broken URL keeps the listing pending and shows up
-			// in the log as repeated download failures.
+			// Give up on images that have already failed too many times so a
+			// single broken URL can never block the listing forever; count them
+			// as resolved so the gallery can reach "complete".
+			$attempt = $attempts[ $key ] ?? 0;
+			$count   = is_array( $attempt ) ? (int) ( $attempt['count'] ?? 0 ) : (int) $attempt;
+			$last    = is_array( $attempt ) ? (int) ( $attempt['last'] ?? 0 ) : 0;
+
+			if ( $count >= $this->max_image_attempts ) {
+				// Do not make a temporary CDN/network problem permanent. Suppress
+				// repeated failures for one hour, then allow a future sync to retry.
+				if ( $last > time() - HOUR_IN_SECONDS ) {
+					$done++;
+					continue;
+				}
+
+				unset( $attempts[ $key ] );
+			}
+
 			$pending[] = [ 'url' => $url, 'key' => $key ];
 		}
 
-		// Download pending images in time-boxed slices, resuming a large image
-		// across polls with HTTP Range. This keeps every request short in
-		// wall-clock so Hostinger's LiteSpeed/LVE never kills it (the 503), no
-		// matter how slow S3 is or how big a single photo is.
+		// Download at most one pending image through WordPress's time- and
+		// size-bounded safe HTTP layer. Larger galleries span multiple polls.
 		$touched = false;
 		foreach ( $pending as $image ) {
 			if ( $this->images_remaining <= 0 || $this->bytes_remaining <= 0 || time() >= $this->request_deadline ) {
@@ -588,41 +659,32 @@ class Eagle_Sync_Engine {
 			$slice = max( 3, $this->request_deadline - time() );
 			$res   = $this->stream_download_image( $image['url'], $image['key'], $slice );
 			$touched = true;
+			$this->images_remaining--;
 
 			$this->bytes_remaining -= (int) ( $res['bytes'] ?? 0 );
 
 			if ( 'complete' === $res['status'] ) {
 				$this->maybe_raise_image_memory();
-				$attId = $this->insert_image_from_tmp( $image['url'], $res['tmp'], $postId, $image['key'] );
+				$attId = $this->insert_image_from_tmp( $image['url'], $image['key'], $res['tmp'], $postId );
 				if ( $attId ) {
 					$attachmentIds[] = $attId;
 					$done++;
-					$this->images_remaining--;
 					unset( $attempts[ $image['key'] ] );
 				} else {
-					$attempts[ $image['key'] ] = (int) ( $attempts[ $image['key'] ] ?? 0 ) + 1;
-				}
-
-				// The insert includes a resize that cannot be interrupted;
-				// stop cleanly after it so the next poll continues with the
-				// remaining images.
-				if ( time() >= $this->request_deadline ) {
-					break;
+					$attempt = $attempts[ $image['key'] ] ?? 0;
+					$count = is_array( $attempt ) ? (int) ( $attempt['count'] ?? 0 ) : (int) $attempt;
+					$attempts[ $image['key'] ] = [ 'count' => $count + 1, 'last' => time() ];
 				}
 				continue;
 			}
 
-			if ( 'partial' === $res['status'] ) {
-				// Still downloading; it resumes on the next poll. This request's
-				// budget is spent on this one image.
-				break;
-			}
-
 			// Failed this attempt; count it so a permanently broken URL is
-			// eventually skipped instead of wedging the listing.
-			$attempts[ $image['key'] ] = (int) ( $attempts[ $image['key'] ] ?? 0 ) + 1;
+			// temporarily skipped instead of wedging the listing.
+			$attempt = $attempts[ $image['key'] ] ?? 0;
+			$count = is_array( $attempt ) ? (int) ( $attempt['count'] ?? 0 ) : (int) $attempt;
+			$attempts[ $image['key'] ] = [ 'count' => $count + 1, 'last' => time() ];
 			if ( ! empty( $res['error'] ) ) {
-				Eagle_Logger::error( 'Image download failed for ' . $image['url'] . ': ' . $res['error'] );
+				Eagle_Logger::error( 'Image download failed for Eagle image ' . $image['key'] . ': ' . $res['error'] );
 			}
 		}
 
@@ -633,9 +695,17 @@ class Eagle_Sync_Engine {
 		// Update the field with everything gathered so far and set the featured
 		// image on the first pass; both are safe to repeat as the gallery grows.
 		if ( ! empty( $attachmentIds ) ) {
-			$field = tdf_field_factory()->create( $fieldId );
-			if ( $field ) {
-				$field->setValue( $this->listing_model( $postId ), $attachmentIds );
+			$attachmentIds = array_values( array_unique( array_map( 'intval', $attachmentIds ) ) );
+
+			try {
+				$field = tdf_field_factory()->create( $fieldId );
+				if ( $field ) {
+					$field->setValue( $this->listing_model( $postId ), $attachmentIds );
+				}
+			} catch ( Throwable $e ) {
+				Eagle_Logger::error(
+					sprintf( 'Gallery field write failed on listing %d: %s', $postId, $e->getMessage() )
+				);
 			}
 
 			if ( ! has_post_thumbnail( $postId ) ) {
@@ -667,7 +737,7 @@ class Eagle_Sync_Engine {
 	/**
 	 * Attachment id previously imported for this image key, or 0.
 	 */
-	private function find_attachment_by_key( string $key ): int {
+	private function find_attachment_by_key( string $key, string $url = '', int $postId = 0 ): int {
 		if ( $key === '' ) {
 			return 0;
 		}
@@ -675,16 +745,121 @@ class Eagle_Sync_Engine {
 		$existing = get_posts(
 			[
 				'post_type'      => 'attachment',
-				'post_status'    => 'any',
-				'posts_per_page' => 1,
+				'post_status'    => 'inherit',
+				'posts_per_page' => 5,
 				'meta_key'       => self::IMAGE_META,
 				'meta_value'     => $key,
 				'fields'         => 'ids',
 				'no_found_rows'  => true,
+				'orderby'        => 'ID',
+				'order'          => 'DESC',
 			]
 		);
 
-		return ! empty( $existing ) ? (int) $existing[0] : 0;
+		foreach ( $existing as $attachmentId ) {
+			if ( $this->attachment_file_exists( (int) $attachmentId ) ) {
+				return (int) $attachmentId;
+			}
+		}
+
+		/*
+		 * Versions before 0.2.0 wrote IMAGE_META only after all WordPress
+		 * sub-sizes had been generated. If the host terminated that expensive
+		 * step, a valid attachment was left behind without its Eagle key and the
+		 * next poll downloaded it again. Adopt the newest matching attachment
+		 * for this listing so upgrading also recovers existing partial imports.
+		 */
+		if ( '' === $url || $postId <= 0 ) {
+			return 0;
+		}
+
+		$urlPath = (string) wp_parse_url( $url, PHP_URL_PATH );
+		$filename = sanitize_file_name( wp_basename( $urlPath ) );
+		$stem = pathinfo( $filename, PATHINFO_FILENAME );
+
+		if ( '' === $stem ) {
+			return 0;
+		}
+
+		$legacy = get_posts(
+			[
+				'post_type'      => 'attachment',
+				'post_status'    => 'inherit',
+				'post_parent'    => $postId,
+				'post_mime_type' => 'image',
+				'posts_per_page' => 5,
+				'fields'         => 'ids',
+				'no_found_rows'  => true,
+				'orderby'        => 'ID',
+				'order'          => 'DESC',
+				'meta_query'     => [
+					'relation' => 'AND',
+					[
+						'key'     => '_wp_attached_file',
+						'value'   => $stem,
+						'compare' => 'LIKE',
+					],
+					[
+						'key'     => self::IMAGE_META,
+						'compare' => 'NOT EXISTS',
+					],
+				],
+			]
+		);
+
+		if ( empty( $legacy ) ) {
+			return 0;
+		}
+
+		$attachmentId = 0;
+		foreach ( $legacy as $candidateId ) {
+			if ( $this->attachment_matches_source_filename( (int) $candidateId, $filename ) ) {
+				$attachmentId = (int) $candidateId;
+				break;
+			}
+		}
+
+		if ( 0 === $attachmentId ) {
+			return 0;
+		}
+
+		update_post_meta( $attachmentId, self::IMAGE_META, $key );
+		Eagle_Logger::log(
+			sprintf( 'Recovered attachment %d left by an interrupted image import.', $attachmentId )
+		);
+
+		return $attachmentId;
+	}
+
+	/**
+	 * An attachment row alone is not enough after an interrupted upload.
+	 */
+	private function attachment_file_exists( int $attachmentId ): bool {
+		$file = get_attached_file( $attachmentId );
+		return is_string( $file ) && '' !== $file && is_file( $file );
+	}
+
+	/**
+	 * Match an interrupted legacy upload without adopting an unrelated image
+	 * whose name merely contains the same text.
+	 */
+	private function attachment_matches_source_filename( int $attachmentId, string $sourceFilename ): bool {
+		if ( ! $this->attachment_file_exists( $attachmentId ) ) {
+			return false;
+		}
+
+		$file          = (string) get_attached_file( $attachmentId );
+		$sourceStem    = pathinfo( $sourceFilename, PATHINFO_FILENAME );
+		$candidateStem = pathinfo( wp_basename( $file ), PATHINFO_FILENAME );
+
+		if ( '' === $sourceStem || '' === $candidateStem ) {
+			return false;
+		}
+
+		return 1 === preg_match(
+			'/^' . preg_quote( $sourceStem, '/' ) . '(?:-\d+)?(?:-scaled)?$/i',
+			$candidateStem
+		);
 	}
 
 	/**
@@ -697,170 +872,105 @@ class Eagle_Sync_Engine {
 	}
 
 	/**
-	 * Download one image in a time-boxed slice, resuming across calls.
+	 * Download one image through WordPress's safe HTTP layer.
 	 *
-	 * The partial download is persisted under uploads/mes-tmp and continued on
-	 * the next poll with an HTTP Range request, so an arbitrarily large image
-	 * is fetched over several short requests instead of one long request that
-	 * the host would kill. curl's own timeout is capped to the slice, which is
-	 * what actually bounds each request's wall-clock.
+	 * wp_safe_remote_get() validates the initial URL and every redirect. The
+	 * response-size cap prevents a single unexpected source file from consuming
+	 * the process memory/disk budget. A failed or timed-out request is discarded
+	 * and can be retried on a later poll.
 	 *
 	 * @return array{status:string,tmp:?string,error:?string,bytes:int}
-	 *         status: complete | partial | failed
+	 *         status: complete | failed
 	 */
 	private function stream_download_image( string $url, string $key, int $budget ): array {
-		if ( ! function_exists( 'curl_init' ) ) {
-			return [ 'status' => 'failed', 'tmp' => null, 'error' => 'curl unavailable', 'bytes' => 0 ];
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+
+		$url = esc_url_raw( $url, [ 'http', 'https' ] );
+		if ( '' === $url || ! wp_http_validate_url( $url ) ) {
+			return [ 'status' => 'failed', 'tmp' => null, 'error' => 'invalid image URL', 'bytes' => 0 ];
 		}
 
-		$dir = $this->partial_dir();
-		if ( '' === $dir ) {
-			return [ 'status' => 'failed', 'tmp' => null, 'error' => 'no temp dir', 'bytes' => 0 ];
+		$tmp = wp_tempnam( 'mes-' . md5( $key ) . '.img' );
+		if ( ! is_string( $tmp ) || '' === $tmp ) {
+			return [ 'status' => 'failed', 'tmp' => null, 'error' => 'cannot create temporary file', 'bytes' => 0 ];
 		}
 
-		$part   = $dir . '/' . md5( $key ) . '.part';
-		$offset = file_exists( $part ) ? (int) filesize( $part ) : 0;
-
-		$fh = fopen( $part, 'cb' ); // Open for write, keep existing bytes.
-		if ( false === $fh ) {
-			return [ 'status' => 'failed', 'tmp' => null, 'error' => 'cannot open partial', 'bytes' => 0 ];
-		}
-		fseek( $fh, 0, SEEK_END );
-
-		$total    = 0;
-		$sawRange = false;
-
-		$ch = curl_init();
-		curl_setopt( $ch, CURLOPT_URL, $url );
-		curl_setopt( $ch, CURLOPT_FILE, $fh );
-		curl_setopt( $ch, CURLOPT_FOLLOWLOCATION, true );
-		curl_setopt( $ch, CURLOPT_SSL_VERIFYPEER, true );
-		curl_setopt( $ch, CURLOPT_CONNECTTIMEOUT, min( 15, max( 5, $budget ) ) );
-		curl_setopt( $ch, CURLOPT_TIMEOUT, max( 5, $budget ) );
-		if ( $offset > 0 ) {
-			curl_setopt( $ch, CURLOPT_RESUME_FROM, $offset );
-		}
-		curl_setopt(
-			$ch,
-			CURLOPT_HEADERFUNCTION,
-			static function ( $handle, $header ) use ( &$total, &$sawRange, $offset ) {
-				if ( 0 === stripos( $header, 'Content-Range:' ) ) {
-					if ( preg_match( '#/\s*(\d+)\s*$#', $header, $m ) ) {
-						$total = (int) $m[1];
-					}
-					$sawRange = true;
-				} elseif ( 0 === $offset && ! $sawRange && 0 === stripos( $header, 'Content-Length:' ) ) {
-					$total = (int) trim( substr( $header, strlen( 'Content-Length:' ) ) );
-				}
-				return strlen( $header );
-			}
+		$maxBytes = max( 1048576, $this->bytes_remaining );
+		$response = wp_safe_remote_get(
+			$url,
+			[
+				'timeout'             => max( 5, min( 20, $budget ) ),
+				'redirection'         => 3,
+				'sslverify'           => true,
+				'stream'              => true,
+				'filename'            => $tmp,
+				'limit_response_size' => $maxBytes + 1,
+				'headers'             => [ 'Accept' => 'image/*' ],
+			]
 		);
 
-		curl_exec( $ch );
-		$errno = curl_errno( $ch );
-		$code  = (int) curl_getinfo( $ch, CURLINFO_RESPONSE_CODE );
-		$err   = curl_error( $ch );
-		curl_close( $ch );
-		fclose( $fh );
+		$bytes = is_file( $tmp ) ? (int) filesize( $tmp ) : 0;
 
-		$have  = file_exists( $part ) ? (int) filesize( $part ) : 0;
-		$bytes = max( 0, $have - $offset );
-
-		// Server ignored the Range (200 to a ranged request): our appended
-		// partial is now inconsistent — discard it and restart next poll.
-		if ( $offset > 0 && 200 === $code ) {
-			@unlink( $part );
-			return [ 'status' => 'partial', 'tmp' => null, 'error' => null, 'bytes' => 0 ];
+		if ( is_wp_error( $response ) ) {
+			@unlink( $tmp );
+			return [ 'status' => 'failed', 'tmp' => null, 'error' => $response->get_error_message(), 'bytes' => $bytes ];
 		}
 
-		// 416 = requested range past EOF, i.e. we already hold the whole file.
-		if ( 416 === $code && $have > 0 ) {
-			return [ 'status' => 'complete', 'tmp' => $part, 'error' => null, 'bytes' => 0 ];
-		}
-
-		// Non-retryable HTTP errors: drop the partial so a later run starts clean.
-		if ( $code >= 400 ) {
-			if ( ! ( 429 === $code || $code >= 500 ) ) {
-				@unlink( $part );
-			}
+		$code = (int) wp_remote_retrieve_response_code( $response );
+		if ( $code < 200 || $code >= 300 ) {
+			@unlink( $tmp );
 			return [ 'status' => 'failed', 'tmp' => null, 'error' => 'HTTP ' . $code, 'bytes' => $bytes ];
 		}
 
-		$complete = ( $total > 0 && $have >= $total )
-			|| ( CURLE_OK === $errno && 0 === $offset && 200 === $code && $have > 0 && 0 === $total );
-
-		if ( $complete && $have > 0 ) {
-			return [ 'status' => 'complete', 'tmp' => $part, 'error' => null, 'bytes' => $bytes ];
+		$contentLength = (int) wp_remote_retrieve_header( $response, 'content-length' );
+		if ( $bytes <= 0 || $bytes > $maxBytes || $contentLength > $maxBytes ) {
+			@unlink( $tmp );
+			$error = $bytes <= 0 ? 'empty response' : 'image exceeds the per-request size limit';
+			return [ 'status' => 'failed', 'tmp' => null, 'error' => $error, 'bytes' => $bytes ];
 		}
 
-		// Made progress but not finished (usually the slice timed out): resume.
-		if ( $bytes > 0 ) {
-			return [ 'status' => 'partial', 'tmp' => null, 'error' => null, 'bytes' => $bytes ];
+		$mime = function_exists( 'wp_get_image_mime' ) ? wp_get_image_mime( $tmp ) : false;
+		if ( ! is_string( $mime ) || 0 !== strpos( $mime, 'image/' ) ) {
+			@unlink( $tmp );
+			return [ 'status' => 'failed', 'tmp' => null, 'error' => 'remote file is not a valid image', 'bytes' => $bytes ];
 		}
 
-		// No progress at all: report a failure so repeated dead attempts exhaust.
-		return [
-			'status' => 'failed',
-			'tmp'    => null,
-			'error'  => '' !== $err ? ( 'cURL ' . $errno . ': ' . $err ) : ( 'HTTP ' . $code ),
-			'bytes'  => 0,
-		];
-	}
-
-	/**
-	 * Directory for in-progress image downloads (created on demand). Empty
-	 * string when the uploads directory is unavailable.
-	 */
-	private function partial_dir(): string {
-		$uploads = wp_upload_dir();
-		if ( ! empty( $uploads['error'] ) || empty( $uploads['basedir'] ) ) {
-			return '';
-		}
-
-		$dir = $uploads['basedir'] . '/mes-tmp';
-		if ( ! is_dir( $dir ) ) {
-			wp_mkdir_p( $dir );
-		}
-
-		return is_dir( $dir ) ? $dir : '';
-	}
-
-	/**
-	 * Delete partial downloads older than 24h. Called at the start of a fresh
-	 * run; a listing still being imported keeps its .part across polls, while
-	 * leftovers from killed runs are swept so they never accumulate.
-	 */
-	private function cleanup_stale_parts(): void {
-		$dir = $this->partial_dir();
-		if ( '' === $dir ) {
-			return;
-		}
-
-		$cutoff = time() - DAY_IN_SECONDS;
-		foreach ( glob( $dir . '/*.part' ) ?: [] as $part ) {
-			if ( is_file( $part ) && filemtime( $part ) < $cutoff ) {
-				@unlink( $part );
-			}
-		}
+		return [ 'status' => 'complete', 'tmp' => $tmp, 'error' => null, 'bytes' => $bytes ];
 	}
 
 	/**
 	 * Create an attachment from a downloaded temp file.
-	 *
-	 * The original file is imported untouched — no downscaling and no
-	 * thumbnail-size generation (per project decision), so an import never
-	 * spends CPU/memory on image processing. Only minimal metadata (width,
-	 * height, path) is recorded so the media library stays functional. The
-	 * dedup key is stored immediately after the attachment row exists, so a
-	 * request killed mid-import never re-downloads the same image.
 	 */
-	private function insert_image_from_tmp( string $url, string $tmp, int $postId, string $key ) {
+	private function insert_image_from_tmp( string $url, string $key, string $tmp, int $postId ) {
 		require_once ABSPATH . 'wp-admin/includes/file.php';
+		require_once ABSPATH . 'wp-admin/includes/image.php';
 		require_once ABSPATH . 'wp-admin/includes/media.php';
 
+		$urlPath  = (string) wp_parse_url( $url, PHP_URL_PATH );
+		$fileName = sanitize_file_name( wp_basename( $urlPath ) );
+		if ( '' === $fileName ) {
+			$fileName = 'eagle-image-' . substr( hash( 'sha256', $key ), 0, 16 ) . '.jpg';
+		}
+		$fileType = wp_check_filetype( $fileName );
+		if ( empty( $fileType['type'] ) ) {
+			$detectedMime = function_exists( 'wp_get_image_mime' ) ? wp_get_image_mime( $tmp ) : false;
+			$extensions   = [
+				'image/jpeg' => 'jpg',
+				'image/png'  => 'png',
+				'image/gif'  => 'gif',
+				'image/webp' => 'webp',
+				'image/avif' => 'avif',
+			];
+
+			if ( is_string( $detectedMime ) && isset( $extensions[ $detectedMime ] ) ) {
+				$fileName       .= '.' . $extensions[ $detectedMime ];
+				$fileType['type'] = $detectedMime;
+			}
+		}
+
 		$file = [
-			'name'     => basename( $url ),
-			'type'     => wp_check_filetype( basename( $url ) )['type'],
+			'name'     => $fileName,
+			'type'     => (string) ( $fileType['type'] ?? '' ),
 			'tmp_name' => $tmp,
 			'error'    => 0,
 			'size'     => filesize( $tmp ),
@@ -869,7 +979,7 @@ class Eagle_Sync_Engine {
 		$sideload = wp_handle_sideload( $file, [ 'test_form' => false ] );
 		if ( isset( $sideload['error'] ) ) {
 			@unlink( $tmp );
-			Eagle_Logger::error( 'Image sideload failed for ' . $url . ': ' . $sideload['error'] );
+			Eagle_Logger::error( 'Image sideload failed for Eagle image ' . $key . ': ' . $sideload['error'] );
 			return false;
 		}
 
@@ -878,28 +988,64 @@ class Eagle_Sync_Engine {
 			'post_title'     => preg_replace( '/\.[^.]+$/', '', sanitize_file_name( basename( $sideload['file'] ) ) ),
 			'post_content'   => '',
 			'post_status'    => 'inherit',
+			'meta_input'     => [
+				self::IMAGE_META => $key,
+			],
 		];
 
-		$attId = wp_insert_attachment( $attachment, $sideload['file'], $postId );
+		$attId = wp_insert_attachment( $attachment, $sideload['file'], $postId, true );
 		if ( ! $attId || is_wp_error( $attId ) ) {
 			@unlink( $sideload['file'] );
-			Eagle_Logger::error( 'Attachment insert failed for ' . $url );
+			Eagle_Logger::error( 'Attachment insert failed for Eagle image ' . $key );
 			return false;
 		}
 
-		// Dedup key first: even if the import below is killed, the next poll
-		// finds this attachment and reuses it instead of re-downloading.
+		/*
+		 * Persist identity before thumbnail generation. This is the critical
+		 * ordering guarantee: even if PHP/the proxy dies below, the next poll
+		 * reuses this attachment instead of inserting another copy.
+		 */
 		update_post_meta( $attId, self::IMAGE_META, $key );
 
-		// Minimal metadata only: no sizes are generated, so this never
-		// touches an image editor and cannot be killed by resize work.
-		$dims = @getimagesize( $sideload['file'] );
-		$meta = [ 'file' => _wp_relative_upload_path( $sideload['file'] ) ];
-		if ( is_array( $dims ) ) {
-			$meta['width']  = $dims[0];
-			$meta['height'] = $dims[1];
+		// Generate only the bounded set MyHome needs for normal cards/galleries.
+		// Additional sizes can be regenerated later without blocking this sync.
+		$limitSubsizes = static function ( $sizes, $metadata, $attachmentId ) use ( $postId ) {
+			if ( ! is_array( $sizes ) ) {
+				return $sizes;
+			}
+
+			$allowed = (array) apply_filters(
+				'mes_allowed_image_subsizes',
+				[ 'thumbnail', 'medium', 'medium_large', 'large' ],
+				$postId,
+				(int) $attachmentId
+			);
+
+			return array_intersect_key( $sizes, array_fill_keys( array_map( 'strval', $allowed ), true ) );
+		};
+		$disableBigImageScaling = static function () {
+			return false;
+		};
+
+		add_filter( 'intermediate_image_sizes_advanced', $limitSubsizes, 99, 3 );
+		add_filter( 'big_image_size_threshold', $disableBigImageScaling, 99 );
+		try {
+			$meta = wp_generate_attachment_metadata( $attId, $sideload['file'] );
+			if ( is_array( $meta ) ) {
+				wp_update_attachment_metadata( $attId, $meta );
+			} else {
+				Eagle_Logger::error( sprintf( 'Image metadata was not generated for attachment %d.', $attId ) );
+			}
+		} catch ( Throwable $e ) {
+			// Keep the original attachment and let the listing continue. A missing
+			// optional thumbnail must never block the entire Eagle sync.
+			Eagle_Logger::error(
+				sprintf( 'Image metadata failed for attachment %d: %s', $attId, $e->getMessage() )
+			);
+		} finally {
+			remove_filter( 'intermediate_image_sizes_advanced', $limitSubsizes, 99 );
+			remove_filter( 'big_image_size_threshold', $disableBigImageScaling, 99 );
 		}
-		wp_update_attachment_metadata( $attId, $meta );
 
 		return (int) $attId;
 	}
@@ -978,6 +1124,7 @@ class Eagle_Sync_Engine {
 		}
 
 		$data['images']     = $node['images'] ?? [];
+		$data['floorplans'] = $node['floorplans'] ?? [];
 		$data['customFields'] = $node['customFields'] ?? [];
 		$data['office']     = $node['office'] ?? '';
 
