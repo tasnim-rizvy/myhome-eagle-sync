@@ -338,7 +338,7 @@ class Eagle_Sync_Engine {
 				)
 			);
 		}
-		$dataVersion = MES_VERSION . ':' . $sourceVersion;
+		$dataVersion = MES_VERSION . ':' . $sourceVersion . ':' . $this->fields->map_version();
 		$dataCurrent = $postId > 0 && hash_equals( (string) get_post_meta( $postId, self::DATA_VERSION_META, true ), $dataVersion );
 
 		// Unique slug: {address}-{eagle id} so the permalink ends with the
@@ -346,30 +346,34 @@ class Eagle_Sync_Engine {
 		$slug = sanitize_title( $this->make_title( $data ) . '-' . $propertyId );
 
 		if ( 0 === $postId ) {
-			$postId = wp_insert_post(
-				[
-					'post_type'   => 'myhome_listing',
-					'post_status' => $this->map_status( $data['status'] ),
-					'post_title'  => $this->make_title( $data ),
-					'post_name'   => $slug,
-					'post_author' => $this->import_author_id(),
-				],
-				true
-			);
+$postId = wp_insert_post(
+			[
+				'post_type'    => 'myhome_listing',
+				'post_status'  => $this->map_status( $data['status'] ),
+				'post_title'   => $this->make_title( $data ),
+				'post_name'    => $slug,
+				'post_author'  => $this->import_author_id(),
+				'post_content' => (string) ( $data['description'] ?? '' ),
+				'post_excerpt' => (string) ( $data['description'] ?? '' ),
+			],
+			true
+		);
 			if ( is_wp_error( $postId ) || ! $postId ) {
 				return $this->upsert_result( is_wp_error( $postId ) ? $postId->get_error_message() : 'insert failed' );
 			}
 			update_post_meta( $postId, self::PROPERTY_META, $propertyId );
 			$created = true;
 		} elseif ( ! $dataCurrent ) {
-			wp_update_post(
-				[
-					'ID'          => $postId,
-					'post_status' => $this->map_status( $data['status'] ),
-					'post_title'  => $this->make_title( $data ),
-					'post_name'   => $slug,
-				]
-			);
+wp_update_post(
+			[
+				'ID'           => $postId,
+				'post_status'  => $this->map_status( $data['status'] ),
+				'post_title'   => $this->make_title( $data ),
+				'post_name'    => $slug,
+				'post_content' => (string) ( $data['description'] ?? '' ),
+				'post_excerpt' => (string) ( $data['description'] ?? '' ),
+			]
+		);
 			$created = false;
 		} else {
 			$created = false;
@@ -1089,16 +1093,31 @@ class Eagle_Sync_Engine {
 	}
 
 	private function write_custom_fields( int $postId, array $data ): void {
-		$map = $this->fields->get_field_map();
 		$raw = [];
 
 		foreach ( $data['customFields'] ?? [] as $cf ) {
 			$name = isset( $cf['name'] ) ? (string) $cf['name'] : '';
 			$val  = $cf['value'] ?? null;
+			$cfKey = (string) ( $cf['key'] ?? '' );
 
-			$key = 'custom_' . sanitize_key( (string) ( $cf['key'] ?? '' ) );
-			$fieldId = $this->fields->get_field_id( $key );
-			if ( $fieldId && isset( $map[ $key ] ) && $val !== null && $val !== '' ) {
+			if ( '' === $cfKey || $val === null || $val === '' ) {
+				$raw[ $name ] = $val;
+				continue;
+			}
+
+			$mapKey = 'custom_' . sanitize_key( $cfKey );
+			$fieldId = $this->fields->get_field_id( $mapKey );
+
+			if ( ! $fieldId ) {
+				$mapKey = 'custom_' . sanitize_key( $name );
+				$fieldId = $this->fields->get_field_id( $mapKey );
+			}
+
+			if ( ! $fieldId ) {
+				$fieldId = $this->fields->create_field( $mapKey, $name, 'text' );
+			}
+
+			if ( $fieldId && $val !== null && $val !== '' ) {
 				update_post_meta( $postId, 'myhome_' . $fieldId, is_scalar( $val ) ? (string) $val : wp_json_encode( $val ) );
 			}
 
@@ -1127,6 +1146,20 @@ class Eagle_Sync_Engine {
 		$data['floorplans'] = $node['floorplans'] ?? [];
 		$data['customFields'] = $node['customFields'] ?? [];
 		$data['office']     = $node['office'] ?? '';
+
+		// The API nests the full address under `address.formattedFullAddress` but
+		// also exposes a short `formattedAddress` at the top level. Lift it so the
+		// field writer can store it like any other scalar.
+		if ( isset( $node['address']['formattedFullAddress'] ) && ! isset( $data['formattedFullAddress'] ) ) {
+			$data['formattedFullAddress'] = $node['address']['formattedFullAddress'];
+		}
+
+		// Vendors come as a nested object — store as JSON text.
+		if ( isset( $node['vendors'] ) && is_array( $node['vendors'] ) ) {
+			$data['vendors'] = wp_json_encode( $node['vendors'] );
+		} else {
+			$data['vendors'] = '';
+		}
 
 		if ( isset( $node['location'] ) && is_array( $node['location'] ) ) {
 			$loc             = $node['location'];

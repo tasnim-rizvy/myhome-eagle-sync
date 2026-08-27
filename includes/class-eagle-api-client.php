@@ -22,6 +22,7 @@ query SyncProperties($limit: Int!, $offset: Int!, $listingTypes: [ListingTypeEnu
       price advertisedPrice showPrice saleOrLease listingType status propertyType
       daysOnMarket featured thumbnailSquare videoUrl onlineTour1Url onlineTour2Url
       bookInspectionLink brochureTitle
+      landSize landSizeUnits
       agencyReference externalPropertyTree
       auctionDatetime listingExpiryDate letDate soldDate rentalDateAvailable
       soldPrice soldDisplay offMarketAt createdAt updatedAt activeAt withdrawnAt

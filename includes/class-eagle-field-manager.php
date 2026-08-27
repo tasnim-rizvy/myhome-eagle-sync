@@ -5,16 +5,16 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Maps Eagle API keys onto the MyHome fields that already exist on the site.
+ * Maps Eagle API keys onto MyHome fields.
  *
- * This manager never creates fields: the sync only writes into fields that
- * are already present (for example the ones added by the theme demo data).
- * The map is derived automatically from the existing myhome_field posts.
+ * Existing myhome_field posts are matched by slug first.  When no match is
+ * found, a new field is created automatically so every piece of data the
+ * Eagle API provides is imported.
  */
 class Eagle_Field_Manager {
 
 	public const DEFAULT_CURRENCY = 'AUD';
-	private const FIELD_MAP_CACHE = 'mes_eagle_field_map_v2';
+	private const FIELD_MAP_CACHE = 'mes_eagle_field_map_v5';
 
 	/**
 	 * Eagle keys whose name differs from the MyHome field slug.
@@ -23,6 +23,7 @@ class Eagle_Field_Manager {
 	 */
 	private const SLUG_ALIASES = [
 		'houseSizes'     => 'property-size',
+		'landSize'       => 'land-size',
 		'garageSpaces'   => 'vehicle-spaces',
 		'totalCarSpaces' => 'vehicle-spaces',
 		'listingType'    => 'offer-type',
@@ -32,10 +33,23 @@ class Eagle_Field_Manager {
 
 	/**
 	 * Static reference table: eagle data key => [label, MyHome field type].
-	 * Used only for matching; no fields are ever created from it.
+	 * Fields that don't exist on the site will be created automatically.
 	 */
 	public static function field_definitions(): array {
 		return [
+			// Identity / address (text) ------------------------------------
+			'reaId'                   => [ __( 'REA ID', 'myhome-eagle-sync' ), 'text' ],
+			'headline'                => [ __( 'Headline', 'myhome-eagle-sync' ), 'text' ],
+			'description'             => [ __( 'Description', 'myhome-eagle-sync' ), 'text' ],
+			'formattedAddress'        => [ __( 'Formatted Address', 'myhome-eagle-sync' ), 'text' ],
+			'formattedFullAddress'    => [ __( 'Full Address', 'myhome-eagle-sync' ), 'text' ],
+			'streetNo'                => [ __( 'Street Number', 'myhome-eagle-sync' ), 'text' ],
+			'street'                  => [ __( 'Street Name', 'myhome-eagle-sync' ), 'text' ],
+			'unit'                    => [ __( 'Unit', 'myhome-eagle-sync' ), 'text' ],
+			'municipality'            => [ __( 'Suburb', 'myhome-eagle-sync' ), 'text' ],
+			'country'                 => [ __( 'Country', 'myhome-eagle-sync' ), 'text' ],
+			'lotNo'                   => [ __( 'Lot Number', 'myhome-eagle-sync' ), 'text' ],
+
 			// Numbers -------------------------------------------------------
 			'bedrooms'                => [ __( 'Bedrooms', 'myhome-eagle-sync' ), 'number' ],
 			'bathrooms'               => [ __( 'Bathrooms', 'myhome-eagle-sync' ), 'number' ],
@@ -46,6 +60,7 @@ class Eagle_Field_Manager {
 			'carportSpaces'           => [ __( 'Carport Spaces', 'myhome-eagle-sync' ), 'number' ],
 			'openCarSpaces'           => [ __( 'Open Car Spaces', 'myhome-eagle-sync' ), 'number' ],
 			'houseSizes'              => [ __( 'House Size', 'myhome-eagle-sync' ), 'number' ],
+			'landSize'                => [ __( 'Land Size', 'myhome-eagle-sync' ), 'number' ],
 			'floorArea'               => [ __( 'Floor Area', 'myhome-eagle-sync' ), 'number' ],
 			'warehouseArea'           => [ __( 'Warehouse Area', 'myhome-eagle-sync' ), 'number' ],
 			'officeArea'              => [ __( 'Office Area', 'myhome-eagle-sync' ), 'number' ],
@@ -54,6 +69,8 @@ class Eagle_Field_Manager {
 			'psmPaMax'                => [ __( 'PSM Per Annum Max', 'myhome-eagle-sync' ), 'number' ],
 			'daysOnMarket'            => [ __( 'Days On Market', 'myhome-eagle-sync' ), 'number' ],
 			'numOffers'               => [ __( 'Number of Offers', 'myhome-eagle-sync' ), 'number' ],
+			'numberOfWebsiteViews'    => [ __( 'Website Views', 'myhome-eagle-sync' ), 'number' ],
+			'numEnquiries'            => [ __( 'Number of Enquiries', 'myhome-eagle-sync' ), 'number' ],
 			'frontage'                => [ __( 'Frontage', 'myhome-eagle-sync' ), 'number' ],
 			'leftDepth'               => [ __( 'Left Depth', 'myhome-eagle-sync' ), 'number' ],
 			'rightDepth'              => [ __( 'Right Depth', 'myhome-eagle-sync' ), 'number' ],
@@ -71,13 +88,31 @@ class Eagle_Field_Manager {
 			// Taxonomies ----------------------------------------------------
 			'propertyType'            => [ __( 'Property Type', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'listingType'             => [ __( 'Listing Type', 'myhome-eagle-sync' ), 'taxonomy' ],
-			'status'                  => [ __( 'Listing Status', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'saleOrLease'             => [ __( 'Sale or Lease', 'myhome-eagle-sync' ), 'taxonomy' ],
+			'commercialPropertyType'  => [ __( 'Commercial Property Type', 'myhome-eagle-sync' ), 'taxonomy' ],
+			'commercialListingType'   => [ __( 'Commercial Listing Type', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'heatingCoolingFeatures'  => [ __( 'Heating / Cooling Features', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'indoorFeatures'          => [ __( 'Indoor Features', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'outdoorFeatures'         => [ __( 'Outdoor Features', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'ecoFriendlyFeatures'     => [ __( 'Eco Friendly Features', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'allowances'              => [ __( 'Allowances', 'myhome-eagle-sync' ), 'taxonomy' ],
+
+			// Display flags (text) ------------------------------------------
+			'showPrice'               => [ __( 'Show Price', 'myhome-eagle-sync' ), 'text' ],
+			'featured'                => [ __( 'Featured', 'myhome-eagle-sync' ), 'text' ],
+			'soldDisplay'             => [ __( 'Sold Display', 'myhome-eagle-sync' ), 'text' ],
+			'thumbnailSquare'         => [ __( 'Thumbnail URL', 'myhome-eagle-sync' ), 'text' ],
+
+			// Dates (as text) ----------------------------------------------
+			'auctionDatetime'         => [ __( 'Auction Date', 'myhome-eagle-sync' ), 'text' ],
+			'listingExpiryDate'       => [ __( 'Listing Expiry Date', 'myhome-eagle-sync' ), 'text' ],
+			'letDate'                 => [ __( 'Let Date', 'myhome-eagle-sync' ), 'text' ],
+			'soldDate'                => [ __( 'Sold Date', 'myhome-eagle-sync' ), 'text' ],
+			'rentalDateAvailable'     => [ __( 'Date Available', 'myhome-eagle-sync' ), 'text' ],
+			'createdAt'               => [ __( 'Created Date', 'myhome-eagle-sync' ), 'text' ],
+			'activeAt'                => [ __( 'Active Date', 'myhome-eagle-sync' ), 'text' ],
+			'withdrawnAt'             => [ __( 'Withdrawn Date', 'myhome-eagle-sync' ), 'text' ],
+			'offMarketAt'             => [ __( 'Off Market Date', 'myhome-eagle-sync' ), 'text' ],
 
 			// Text ----------------------------------------------------------
 			'agencyReference'         => [ __( 'Agency Reference', 'myhome-eagle-sync' ), 'text' ],
@@ -103,15 +138,18 @@ class Eagle_Field_Manager {
 			'onlineTour1Url'          => [ __( 'Online Tour URL', 'myhome-eagle-sync' ), 'text' ],
 			'onlineTour2Url'          => [ __( 'Online Tour URL 2', 'myhome-eagle-sync' ), 'text' ],
 			'bookInspectionLink'      => [ __( 'Book Inspection Link', 'myhome-eagle-sync' ), 'text' ],
-			'formattedAddress'        => [ __( 'Formatted Address', 'myhome-eagle-sync' ), 'text' ],
-			'formattedFullAddress'    => [ __( 'Full Address', 'myhome-eagle-sync' ), 'text' ],
-
-			// Dates (as text) ----------------------------------------------
-			'auctionDatetime'         => [ __( 'Auction Date', 'myhome-eagle-sync' ), 'text' ],
-			'listingExpiryDate'       => [ __( 'Listing Expiry Date', 'myhome-eagle-sync' ), 'text' ],
-			'letDate'                 => [ __( 'Let Date', 'myhome-eagle-sync' ), 'text' ],
-			'soldDate'                => [ __( 'Sold Date', 'myhome-eagle-sync' ), 'text' ],
-			'rentalDateAvailable'     => [ __( 'Date Available', 'myhome-eagle-sync' ), 'text' ],
+			'houseSizeUnits'          => [ __( 'House Size Units', 'myhome-eagle-sync' ), 'text' ],
+			'landSizeUnits'           => [ __( 'Land Size Units', 'myhome-eagle-sync' ), 'text' ],
+			'establishedOrDevelopment'=> [ __( 'Established / Development', 'myhome-eagle-sync' ), 'text' ],
+			'holidayRental'           => [ __( 'Holiday Rental', 'myhome-eagle-sync' ), 'text' ],
+			'floorAreaUnits'          => [ __( 'Floor Area Units', 'myhome-eagle-sync' ), 'text' ],
+			'leaseExpiryDate'         => [ __( 'Lease Expiry Date', 'myhome-eagle-sync' ), 'text' ],
+			'returnOnInvestment'      => [ __( 'Return on Investment', 'myhome-eagle-sync' ), 'text' ],
+			'crossOver'               => [ __( 'Cross Over', 'myhome-eagle-sync' ), 'text' ],
+			'saleOrTender'            => [ __( 'Sale or Tender', 'myhome-eagle-sync' ), 'text' ],
+			'tenderDate'              => [ __( 'Tender Date', 'myhome-eagle-sync' ), 'text' ],
+			'terms'                   => [ __( 'Terms', 'myhome-eagle-sync' ), 'text' ],
+			'vendors'                 => [ __( 'Vendors', 'myhome-eagle-sync' ), 'text' ],
 
 			// Special -------------------------------------------------------
 			'gallery'                 => [ __( 'Gallery', 'myhome-eagle-sync' ), 'gallery' ],
@@ -121,16 +159,61 @@ class Eagle_Field_Manager {
 	}
 
 	// ---------------------------------------------------------------------
-	// Field map (existing fields only)
+	// Field creation
 	// ---------------------------------------------------------------------
 
 	/**
-	 * Build the eagle key => existing MyHome field id map.
+	 * Create a myhome_field post for an Eagle key that has no existing match.
+	 *
+	 * @return int The new field ID (post ID), or 0 on failure.
+	 */
+	public function create_field( string $eagleKey, string $label, string $type ): int {
+		$slug = self::key_to_slug( $eagleKey );
+
+		$postId = wp_insert_post(
+			[
+				'post_type'   => 'myhome_field',
+				'post_status' => 'publish',
+				'post_title'  => $label,
+			],
+			true
+		);
+
+		if ( is_wp_error( $postId ) || ! $postId ) {
+			Eagle_Logger::error( 'Failed to create field for ' . $eagleKey . ': ' . ( is_wp_error( $postId ) ? $postId->get_error_message() : 'insert failed' ) );
+			return 0;
+		}
+
+		update_post_meta( $postId, 'type', $type );
+		update_post_meta( $postId, 'slug', $slug );
+
+		Eagle_Logger::log( sprintf( 'Created field "%s" (id %d, type %s) for Eagle key %s.', $label, $postId, $type, $eagleKey ) );
+
+		return (int) $postId;
+	}
+
+	/**
+	 * Convert an Eagle camelCase key to a hyphenated slug.
+	 */
+	private static function key_to_slug( string $key ): string {
+		$slug = preg_replace( '/([A-Z])/', '-$1', $key );
+		$slug = strtolower( trim( $slug, '-' ) );
+		return preg_replace( '/-+/', '-', $slug );
+	}
+
+	// ---------------------------------------------------------------------
+	// Field map (existing + auto-created fields)
+	// ---------------------------------------------------------------------
+
+	/**
+	 * Build the eagle key => MyHome field id map.
 	 *
 	 * The match is made on the field slug (with a few aliases for keys whose
 	 * names differ). When several existing fields share a slug (demo
 	 * duplicates), the field that already holds values in the current
 	 * listings wins; ties resolve to the lowest field id.
+	 *
+	 * If no existing field matches, one is created automatically.
 	 */
 	public function get_field_map(): array {
 		static $cached = null;
@@ -169,12 +252,28 @@ class Eagle_Field_Manager {
 		$map = [];
 
 		$gallery = $this->first_match( $fields, static fn( array $f ) => 'gallery' === $f['type'] );
+		if ( ! $gallery ) {
+			// No gallery field exists — create one.
+			$newId = $this->create_field( 'gallery', __( 'Gallery', 'myhome-eagle-sync' ), 'gallery' );
+			if ( $newId > 0 ) {
+				$gallery = [ 'id' => $newId, 'type' => 'gallery', 'slug' => 'gallery', 'title' => 'Gallery' ];
+				$fields[] = $gallery;
+			}
+		}
 		if ( $gallery ) {
 			$map['gallery']    = $gallery['id'];
 			$map['floorplans'] = $gallery['id'];
 		}
 
 		$location = $this->first_match( $fields, static fn( array $f ) => 'location' === $f['type'] );
+		if ( ! $location ) {
+			// No location field exists — create one.
+			$newId = $this->create_field( 'location', __( 'Location', 'myhome-eagle-sync' ), 'location' );
+			if ( $newId > 0 ) {
+				$location = [ 'id' => $newId, 'type' => 'location', 'slug' => 'location', 'title' => 'Location' ];
+				$fields[] = $location;
+			}
+		}
 		if ( $location ) {
 			$map['location'] = $location['id'];
 		}
@@ -184,6 +283,8 @@ class Eagle_Field_Manager {
 				continue;
 			}
 
+			$label = $definition[0];
+			$type  = $definition[1];
 			$field = null;
 
 			if ( in_array( $key, [ 'videoUrl', 'onlineTour1Url', 'onlineTour2Url' ], true ) ) {
@@ -199,6 +300,20 @@ class Eagle_Field_Manager {
 
 			if ( $field ) {
 				$map[ $key ] = $field['id'];
+			} elseif ( $key !== 'status' ) {
+				// No existing field found — create one automatically.
+				$newId = $this->create_field( $key, $label, $type );
+				if ( $newId > 0 ) {
+					$map[ $key ] = $newId;
+					// Add to the in-memory list so subsequent keys with the
+					// same slug reuse this field instead of creating another.
+					$fields[] = [
+						'id'    => $newId,
+						'type'  => $type,
+						'slug'  => self::key_to_slug( $key ),
+						'title' => $label,
+					];
+				}
 			}
 		}
 
@@ -211,6 +326,22 @@ class Eagle_Field_Manager {
 		$map = $this->get_field_map();
 
 		return (int) ( $map[ $key ] ?? 0 );
+	}
+
+	/**
+	 * Stable fingerprint of the current field map.
+	 *
+	 * Included in the per-listing data version so that when the field map
+	 * changes (new auto-created fields, re-mapped slugs, etc.) every listing
+	 * is re-imported on the next sync, even when the API updatedAt is
+	 * unchanged. Without this, newly added fields stay empty on listings
+	 * that are otherwise considered "current".
+	 */
+	public function map_version(): string {
+		$map = $this->get_field_map();
+		ksort( $map );
+
+		return substr( hash( 'sha256', wp_json_encode( $map ) ), 0, 12 );
 	}
 
 	/**
