@@ -551,7 +551,7 @@ wp_update_post(
 		$ids   = [];
 
 		foreach ( $names as $name ) {
-			$name = trim( (string) $name );
+			$name = trim( $this->humanize_enum( (string) $name ) );
 			if ( $name === '' ) {
 				continue;
 			}
@@ -567,6 +567,16 @@ wp_update_post(
 		}
 
 		return $ids;
+	}
+
+	/**
+	 * Convert SCREAMING_SNAKE_CASE enum to Human Readable Text.
+	 */
+	private function humanize_enum( string $value ): string {
+		if ( preg_match( '/^[A-Z][A-Z0-9_]+$/', $value ) ) {
+			return ucwords( strtolower( str_replace( '_', ' ', $value ) ) );
+		}
+		return $value;
 	}
 
 	/**
