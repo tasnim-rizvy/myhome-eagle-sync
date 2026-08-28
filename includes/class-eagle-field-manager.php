@@ -127,6 +127,11 @@ class Eagle_Field_Manager {
 			'zoning'                  => [ __( 'Zoning', 'myhome-eagle-sync' ), 'text' ],
 			'occupancyTitle'          => [ __( 'Occupancy Title', 'myhome-eagle-sync' ), 'text' ],
 			'parkingComments'         => [ __( 'Parking Comments', 'myhome-eagle-sync' ), 'text' ],
+
+			// Parsed address fields ------------------------------------------
+			'suburb'                  => [ __( 'Suburb', 'myhome-eagle-sync' ), 'text' ],
+			'state'                   => [ __( 'State', 'myhome-eagle-sync' ), 'text' ],
+			'postcode'                => [ __( 'Postcode', 'myhome-eagle-sync' ), 'text' ],
 			'fencing'                 => [ __( 'Fencing', 'myhome-eagle-sync' ), 'text' ],
 			'irrigation'              => [ __( 'Irrigation', 'myhome-eagle-sync' ), 'text' ],
 			'annualRainfall'          => [ __( 'Annual Rainfall', 'myhome-eagle-sync' ), 'text' ],

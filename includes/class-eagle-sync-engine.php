@@ -1170,6 +1170,14 @@ wp_update_post(
 			$data['formattedFullAddress'] = $node['address']['formattedFullAddress'];
 		}
 
+		// Parse suburb, state, postcode from the formatted address.
+		$fullAddr = $data['formattedFullAddress'] ?? '';
+		if ( preg_match( '/,\s*(.+?)\s+([A-Z]{2,3})\s+(\d{4})$/', $fullAddr, $addrMatch ) ) {
+			$data['suburb']  = $addrMatch[1];
+			$data['state']   = $addrMatch[2];
+			$data['postcode'] = $addrMatch[3];
+		}
+
 		// Vendors come as a nested object — store as JSON text.
 		if ( isset( $node['vendors'] ) && is_array( $node['vendors'] ) ) {
 			$data['vendors'] = wp_json_encode( $node['vendors'] );
