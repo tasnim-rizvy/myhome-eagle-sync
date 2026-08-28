@@ -570,12 +570,30 @@ wp_update_post(
 	}
 
 	/**
-	 * Convert SCREAMING_SNAKE_CASE enum to Human Readable Text.
+	 * Convert SCREAMING_SNAKE_CASE or ALL CAPS text to Human Readable Text.
+	 * Preserves short codes like NSW, QLD, 2179.
 	 */
 	private function humanize_enum( string $value ): string {
-		if ( preg_match( '/^[A-Z][A-Z0-9_]+$/', $value ) ) {
+		// Already has lowercase letters — leave as-is.
+		if ( preg_match( '/[a-z]/', $value ) ) {
+			return $value;
+		}
+
+		// Short all-digits code (postcode) — preserve.
+		if ( strlen( $value ) <= 4 && preg_match( '/^[0-9]+$/', $value ) ) {
+			return $value;
+		}
+
+		// Short all-caps letter code (state abbreviation) — preserve.
+		if ( strlen( $value ) <= 3 && preg_match( '/^[A-Z]+$/', $value ) ) {
+			return $value;
+		}
+
+		// SCREAMING_SNAKE_CASE or ALL CAPS with spaces.
+		if ( preg_match( '/^[A-Z][A-Z0-9_ ]+$/', $value ) && strlen( $value ) >= 4 ) {
 			return ucwords( strtolower( str_replace( '_', ' ', $value ) ) );
 		}
+
 		return $value;
 	}
 

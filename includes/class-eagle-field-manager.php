@@ -128,7 +128,7 @@ class Eagle_Field_Manager {
 			'parkingComments'         => [ __( 'Parking Comments', 'myhome-eagle-sync' ), 'text' ],
 
 			// Parsed address fields ------------------------------------------
-			'suburb'                  => [ __( 'Suburb', 'myhome-eagle-sync' ), 'text' ],
+			'suburb'                  => [ __( 'Suburb', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'state'                   => [ __( 'State', 'myhome-eagle-sync' ), 'text' ],
 			'postcode'                => [ __( 'Postcode', 'myhome-eagle-sync' ), 'text' ],
 			'fencing'                 => [ __( 'Fencing', 'myhome-eagle-sync' ), 'text' ],
