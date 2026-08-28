@@ -34,8 +34,8 @@ query SyncProperties($limit: Int!, $offset: Int!, $listingTypes: [ListingTypeEnu
       office { id name }
       address { formattedFullAddress }
       listingDetails {
-        ... on ResidentialSale { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes houseSizeUnits propertyType status establishedOrDevelopment energyEfficiencyRating }
-        ... on ResidentialRental { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes houseSizeUnits propertyType status rentalPerWeek rentalPerMonth bond holidayRental }
+        ... on ResidentialSale { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes houseSizeUnits propertyType status establishedOrDevelopment energyEfficiencyRating heatingCoolingFeatures indoorFeatures outdoorFeatures ecoFriendlyFeatures }
+        ... on ResidentialRental { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes houseSizeUnits propertyType status rentalPerWeek rentalPerMonth bond holidayRental heatingCoolingFeatures indoorFeatures outdoorFeatures ecoFriendlyFeatures }
         ... on Commercial { commercialPropertyType commercialListingType floorArea floorAreaUnits leaseExpiryDate leaseTerm outgoings tax tenancy zoning occupancyTitle parkingComments warehouseArea officeArea psmPaMin psmPaMax returnOnInvestment totalCarSpaces price status }
         ... on Rural { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes houseSizeUnits propertyType status carryingCapacity fencing irrigation annualRainfall soilTypes councilRates improvements price }
         ... on Land { price status crossOver frontage leftDepth rightDepth rearDepth }
