@@ -88,7 +88,6 @@ class Eagle_Field_Manager {
 			// Taxonomies ----------------------------------------------------
 			'propertyType'            => [ __( 'Property Type', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'listingType'             => [ __( 'Listing Type', 'myhome-eagle-sync' ), 'taxonomy' ],
-			'saleOrLease'             => [ __( 'Sale or Lease', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'commercialPropertyType'  => [ __( 'Commercial Property Type', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'commercialListingType'   => [ __( 'Commercial Listing Type', 'myhome-eagle-sync' ), 'taxonomy' ],
 			'heatingCoolingFeatures'  => [ __( 'Heating / Cooling Features', 'myhome-eagle-sync' ), 'taxonomy' ],
