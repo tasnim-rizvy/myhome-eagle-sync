@@ -189,6 +189,15 @@ class Eagle_Field_Manager {
 
 		update_post_meta( $postId, 'type', $type );
 		update_post_meta( $postId, 'slug', $slug );
+		update_post_meta( $postId, '_mes_eagle_field_for_key', $eagleKey );
+
+		$multiSelectKeys = [
+			'heatingCoolingFeatures', 'indoorFeatures', 'outdoorFeatures',
+			'ecoFriendlyFeatures', 'allowances',
+		];
+		if ( 'taxonomy' === $type && in_array( $eagleKey, $multiSelectKeys, true ) ) {
+			update_post_meta( $postId, 'multiple_values', '1' );
+		}
 
 		Eagle_Logger::log( sprintf( 'Created field "%s" (id %d, type %s) for Eagle key %s.', $label, $postId, $type, $eagleKey ) );
 
