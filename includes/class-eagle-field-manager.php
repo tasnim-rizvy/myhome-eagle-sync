@@ -138,11 +138,10 @@ class Eagle_Field_Manager {
 			'onlineTour1Url'          => [ __( 'Online Tour URL', 'myhome-eagle-sync' ), 'text' ],
 			'onlineTour2Url'          => [ __( 'Online Tour URL 2', 'myhome-eagle-sync' ), 'text' ],
 			'bookInspectionLink'      => [ __( 'Book Inspection Link', 'myhome-eagle-sync' ), 'text' ],
-			'houseSizeUnits'          => [ __( 'House Size Units', 'myhome-eagle-sync' ), 'text' ],
-			'landSizeUnits'           => [ __( 'Land Size Units', 'myhome-eagle-sync' ), 'text' ],
+
 			'establishedOrDevelopment'=> [ __( 'Established / Development', 'myhome-eagle-sync' ), 'text' ],
 			'holidayRental'           => [ __( 'Holiday Rental', 'myhome-eagle-sync' ), 'text' ],
-			'floorAreaUnits'          => [ __( 'Floor Area Units', 'myhome-eagle-sync' ), 'text' ],
+
 			'leaseExpiryDate'         => [ __( 'Lease Expiry Date', 'myhome-eagle-sync' ), 'text' ],
 			'returnOnInvestment'      => [ __( 'Return on Investment', 'myhome-eagle-sync' ), 'text' ],
 			'crossOver'               => [ __( 'Cross Over', 'myhome-eagle-sync' ), 'text' ],

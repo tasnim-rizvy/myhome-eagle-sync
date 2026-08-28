@@ -22,7 +22,7 @@ query SyncProperties($limit: Int!, $offset: Int!, $listingTypes: [ListingTypeEnu
       price advertisedPrice showPrice saleOrLease listingType status propertyType
       daysOnMarket featured thumbnailSquare videoUrl onlineTour1Url onlineTour2Url
       bookInspectionLink brochureTitle
-      landSize landSizeUnits
+      landSize
       agencyReference externalPropertyTree
       auctionDatetime listingExpiryDate letDate soldDate rentalDateAvailable
       soldPrice soldDisplay offMarketAt createdAt updatedAt activeAt withdrawnAt
@@ -34,12 +34,12 @@ query SyncProperties($limit: Int!, $offset: Int!, $listingTypes: [ListingTypeEnu
       office { id name }
       address { formattedFullAddress }
       listingDetails {
-        ... on ResidentialSale { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes houseSizeUnits propertyType status establishedOrDevelopment energyEfficiencyRating heatingCoolingFeatures indoorFeatures outdoorFeatures ecoFriendlyFeatures }
-        ... on ResidentialRental { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes houseSizeUnits propertyType status rentalPerWeek rentalPerMonth bond holidayRental heatingCoolingFeatures indoorFeatures outdoorFeatures ecoFriendlyFeatures }
-        ... on Commercial { commercialPropertyType commercialListingType floorArea floorAreaUnits leaseExpiryDate leaseTerm outgoings tax tenancy zoning occupancyTitle parkingComments warehouseArea officeArea psmPaMin psmPaMax returnOnInvestment totalCarSpaces price status }
-        ... on Rural { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes houseSizeUnits propertyType status carryingCapacity fencing irrigation annualRainfall soilTypes councilRates improvements price }
+        ... on ResidentialSale { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes propertyType status establishedOrDevelopment energyEfficiencyRating heatingCoolingFeatures indoorFeatures outdoorFeatures ecoFriendlyFeatures }
+        ... on ResidentialRental { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes propertyType status rentalPerWeek rentalPerMonth bond holidayRental heatingCoolingFeatures indoorFeatures outdoorFeatures ecoFriendlyFeatures }
+        ... on Commercial { commercialPropertyType commercialListingType floorArea leaseExpiryDate leaseTerm outgoings tax tenancy zoning occupancyTitle parkingComments warehouseArea officeArea psmPaMin psmPaMax returnOnInvestment totalCarSpaces price status }
+        ... on Rural { bedrooms bathrooms ensuites toilets livingAreas garageSpaces carportSpaces openCarSpaces houseSizes propertyType status carryingCapacity fencing irrigation annualRainfall soilTypes councilRates improvements price }
         ... on Land { price status crossOver frontage leftDepth rightDepth rearDepth }
-        ... on Business { businessName propertyType status price saleOrTender tenderDate terms floorArea floorAreaUnits }
+        ... on Business { businessName propertyType status price saleOrTender tenderDate terms floorArea }
       }
     }
   }
