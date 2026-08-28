@@ -1139,7 +1139,13 @@ wp_update_post(
 		unset( $data['listingDetails'] );
 
 		if ( isset( $node['listingDetails'] ) && is_array( $node['listingDetails'] ) ) {
+			// Preserve the top-level price (dollars) — listingDetails.price is in
+			// cents (100× the real value) and would overwrite it on merge.
+			$rootPrice = $node['price'] ?? null;
 			$data = array_merge( $data, $node['listingDetails'] );
+			if ( $rootPrice !== null ) {
+				$data['price'] = $rootPrice;
+			}
 		}
 
 		$data['images']     = $node['images'] ?? [];

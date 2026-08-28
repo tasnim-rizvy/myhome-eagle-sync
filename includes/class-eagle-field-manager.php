@@ -78,7 +78,7 @@ class Eagle_Field_Manager {
 
 			// Prices --------------------------------------------------------
 			'price'                   => [ __( 'Price', 'myhome-eagle-sync' ), 'price' ],
-			'advertisedPrice'         => [ __( 'Advertised Price', 'myhome-eagle-sync' ), 'price' ],
+			'advertisedPrice'         => [ __( 'Advertised Price', 'myhome-eagle-sync' ), 'text' ],
 			'soldPrice'               => [ __( 'Sold Price', 'myhome-eagle-sync' ), 'price' ],
 			'rentalPerWeek'           => [ __( 'Rental Per Week', 'myhome-eagle-sync' ), 'price' ],
 			'rentalPerMonth'          => [ __( 'Rental Per Month', 'myhome-eagle-sync' ), 'price' ],
@@ -294,7 +294,7 @@ class Eagle_Field_Manager {
 					static fn( array $f ) => 'embed' === $f['type'] && false !== stripos( $f['title'], $pattern )
 				);
 			} elseif ( $key !== 'status' ) {
-				$slug  = self::SLUG_ALIASES[ $key ] ?? $key;
+				$slug  = self::SLUG_ALIASES[ $key ] ?? self::key_to_slug( $key );
 				$field = $this->first_match( $fields, static fn( array $f ) => $f['slug'] === $slug );
 			}
 
