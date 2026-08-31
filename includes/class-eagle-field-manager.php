@@ -161,12 +161,12 @@ class Eagle_Field_Manager {
 			'agentPhone'              => [ __( 'Agent Phone', 'myhome-eagle-sync' ), 'text' ],
 			'agentMobile'             => [ __( 'Agent Mobile', 'myhome-eagle-sync' ), 'text' ],
 			'agentOffice'             => [ __( 'Agent Office', 'myhome-eagle-sync' ), 'text' ],
-			'agentAvatarUrl'          => [ __( 'Agent Photo URL', 'myhome-eagle-sync' ), 'text' ],
 
 			// Special -------------------------------------------------------
 			'gallery'                 => [ __( 'Gallery', 'myhome-eagle-sync' ), 'gallery' ],
 			'floorplans'              => [ __( 'Floorplans', 'myhome-eagle-sync' ), 'gallery' ],
 			'location'                => [ __( 'Location', 'myhome-eagle-sync' ), 'location' ],
+			'agentPhoto'              => [ __( 'Agent Photo', 'myhome-eagle-sync' ), 'gallery' ],
 		];
 	}
 
@@ -301,6 +301,18 @@ class Eagle_Field_Manager {
 		}
 		if ( $location ) {
 			$map['location'] = $location['id'];
+		}
+
+		$agentPhoto = $this->first_match( $fields, static fn( array $f ) => 'gallery' === $f['type'] && 'agent-photo' === $f['slug'] );
+		if ( ! $agentPhoto ) {
+			$newId = $this->create_field( 'agentPhoto', __( 'Agent Photo', 'myhome-eagle-sync' ), 'gallery' );
+			if ( $newId > 0 ) {
+				$agentPhoto = [ 'id' => $newId, 'type' => 'gallery', 'slug' => 'agent-photo', 'title' => 'Agent Photo' ];
+				$fields[] = $agentPhoto;
+			}
+		}
+		if ( $agentPhoto ) {
+			$map['agentPhoto'] = $agentPhoto['id'];
 		}
 
 		foreach ( self::field_definitions() as $key => $definition ) {

@@ -15,6 +15,7 @@ class Eagle_Sync_Engine {
 	public const AGENTS_META = '_mes_eagle_agents';
 	public const OFFICE_META = '_mes_eagle_office';
 	public const CUSTOM_FIELDS_META = '_mes_eagle_custom_fields';
+	public const AGENT_PHOTO_META = '_mes_eagle_agent_photo_id';
 	public const IMAGE_ATTEMPTS_META = '_mes_eagle_image_attempts';
 	public const IMAGE_ATTEMPTS_VERSION_META = '_mes_eagle_image_attempts_version';
 	public const DATA_VERSION_META = '_mes_eagle_data_version';
@@ -391,6 +392,7 @@ wp_update_post(
 			}
 
 			$this->write_agents( $postId, $data );
+			$this->write_agent_photo( $postId, $data );
 			$this->write_custom_fields( $postId, $data );
 			update_post_meta( $postId, self::DATA_VERSION_META, $dataVersion );
 		}
@@ -455,7 +457,7 @@ wp_update_post(
 		foreach ( $map as $key => $fieldId ) {
 			// These structured values are handled by write_gallery(), not by the
 			// generic scalar field path below.
-			if ( in_array( $key, [ 'gallery', 'floorplans' ], true ) ) {
+			if ( in_array( $key, [ 'gallery', 'floorplans', 'agentPhoto' ], true ) ) {
 				continue;
 			}
 
@@ -1112,6 +1114,7 @@ wp_update_post(
 							'phone'   => (string) ( $agent['phone'] ?? '' ),
 							'mobile'  => (string) ( $agent['mobile'] ?? '' ),
 							'office'  => (string) $office,
+							'avatarUrl' => trim( (string) ( $agent['avatarUrl'] ?? '' ) ),
 						];
 					},
 					$data['agents'] ?? []
@@ -1126,6 +1129,81 @@ wp_update_post(
 
 		update_post_meta( $postId, self::AGENTS_META, $agents );
 		update_post_meta( $postId, self::OFFICE_META, (string) $office );
+	}
+
+	/**
+	 * Download the primary agent's avatar and add it to the agent photo gallery field.
+	 */
+	private function write_agent_photo( int $postId, array $data ): void {
+		$avatarUrl = '';
+		$agents    = $data['agents'] ?? [];
+		$primary   = reset( $agents );
+		if ( is_array( $primary ) ) {
+			$avatarUrl = trim( (string) ( $primary['avatarUrl'] ?? '' ) );
+		}
+
+		if ( $avatarUrl === '' ) {
+			return;
+		}
+
+		$fieldId = $this->fields->get_field_id( 'agentPhoto' );
+		if ( ! $fieldId ) {
+			return;
+		}
+
+		// Already imported?
+		$existing = (int) get_post_meta( $postId, self::AGENT_PHOTO_META, true );
+		$galleryKey = tdf_prefix() . '_' . $fieldId;
+
+		// If the attachment was already imported, just ensure the gallery field is set.
+		if ( $existing > 0 && get_post_status( $existing ) ) {
+			update_post_meta( $postId, $galleryKey, [ $existing ] );
+			return;
+		}
+
+		require_once ABSPATH . 'wp-admin/includes/media.php';
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+		require_once ABSPATH . 'wp-admin/includes/image.php';
+
+		$tmp = download_url( $avatarUrl, 30 );
+		if ( is_wp_error( $tmp ) ) {
+			Eagle_Logger::error( sprintf( 'Agent photo download failed for listing %d: %s', $postId, $tmp->get_error_message() ) );
+			return;
+		}
+
+		$filename = 'agent-photo-' . $postId . '-' . wp_unique_filename( wp_upload_dir()['path'], basename( wp_parse_url( $avatarUrl, PHP_URL_PATH ) ?: 'agent.jpg' ) );
+		$move     = rename( $tmp, wp_upload_dir()['path'] . '/' . $filename );
+		if ( ! $move ) {
+			@unlink( $tmp );
+			Eagle_Logger::error( sprintf( 'Agent photo move failed for listing %d', $postId ) );
+			return;
+		}
+
+		$filetype = wp_check_filetype( $filename );
+		$attachment = wp_insert_attachment(
+			[
+				'post_mime_type' => $filetype['type'] ?: 'image/jpeg',
+				'post_title'     => 'Agent Photo — Listing ' . $postId,
+				'post_status'    => 'inherit',
+				'post_parent'    => $postId,
+			],
+			wp_upload_dir()['path'] . '/' . $filename,
+			$postId
+		);
+
+		if ( is_wp_error( $attachment ) || ! $attachment ) {
+			Eagle_Logger::error( sprintf( 'Agent photo attach failed for listing %d', $postId ) );
+			return;
+		}
+
+		$metadata = wp_generate_attachment_metadata( $attachment, wp_upload_dir()['path'] . '/' . $filename );
+		wp_update_attachment_metadata( $attachment, $metadata );
+		update_post_meta( $postId, self::AGENT_PHOTO_META, $attachment );
+
+		// Set the gallery field with the agent photo attachment.
+		update_post_meta( $postId, $galleryKey, [ $attachment ] );
+
+		Eagle_Logger::log( sprintf( 'Agent photo attached to listing %d (attachment %d)', $postId, $attachment ) );
 	}
 
 	private function write_custom_fields( int $postId, array $data ): void {
