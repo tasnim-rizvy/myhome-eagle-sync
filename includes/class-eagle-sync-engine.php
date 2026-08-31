@@ -1223,6 +1223,23 @@ wp_update_post(
 			$data['vendors'] = '';
 		}
 
+		// Extract primary agent details for individual fields.
+		$agents = $node['agents'] ?? [];
+		$primary = reset( $agents );
+		if ( is_array( $primary ) ) {
+			$office = $primary['office'] ?? '';
+			if ( is_array( $office ) ) {
+				$office = $office['name'] ?? '';
+			}
+			$data['agentName']   = trim( (string) ( $primary['name'] ?? '' ) );
+			$data['agentTitle']  = trim( (string) ( $primary['title'] ?? '' ) );
+			$data['agentEmail']  = trim( (string) ( $primary['email'] ?? '' ) );
+			$data['agentPhone']  = trim( (string) ( $primary['phone'] ?? '' ) );
+			$data['agentMobile'] = trim( (string) ( $primary['mobile'] ?? '' ) );
+			$data['agentOffice'] = trim( (string) $office );
+			$data['agentAvatarUrl'] = trim( (string) ( $primary['avatarUrl'] ?? '' ) );
+		}
+
 		if ( isset( $node['location'] ) && is_array( $node['location'] ) ) {
 			$loc             = $node['location'];
 			$data['location'] = [

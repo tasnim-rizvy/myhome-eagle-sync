@@ -30,7 +30,7 @@ query SyncProperties($limit: Int!, $offset: Int!, $listingTypes: [ListingTypeEnu
       customFields { key name fieldType value allowedValues }
       images { id position url }
       floorplans { id position url }
-      agents { id name title email phone mobile office { id name } }
+      agents { id name title email phone mobile avatarUrl office { id name } }
       office { id name }
       address { formattedFullAddress }
       listingDetails {

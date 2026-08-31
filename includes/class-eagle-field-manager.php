@@ -154,6 +154,15 @@ class Eagle_Field_Manager {
 			'terms'                   => [ __( 'Terms', 'myhome-eagle-sync' ), 'text' ],
 			'vendors'                 => [ __( 'Vendors', 'myhome-eagle-sync' ), 'text' ],
 
+			// Agent details (primary agent) ----------------------------------
+			'agentName'               => [ __( 'Agent Name', 'myhome-eagle-sync' ), 'text' ],
+			'agentTitle'              => [ __( 'Agent Title', 'myhome-eagle-sync' ), 'text' ],
+			'agentEmail'              => [ __( 'Agent Email', 'myhome-eagle-sync' ), 'text' ],
+			'agentPhone'              => [ __( 'Agent Phone', 'myhome-eagle-sync' ), 'text' ],
+			'agentMobile'             => [ __( 'Agent Mobile', 'myhome-eagle-sync' ), 'text' ],
+			'agentOffice'             => [ __( 'Agent Office', 'myhome-eagle-sync' ), 'text' ],
+			'agentAvatarUrl'          => [ __( 'Agent Photo URL', 'myhome-eagle-sync' ), 'text' ],
+
 			// Special -------------------------------------------------------
 			'gallery'                 => [ __( 'Gallery', 'myhome-eagle-sync' ), 'gallery' ],
 			'floorplans'              => [ __( 'Floorplans', 'myhome-eagle-sync' ), 'gallery' ],
