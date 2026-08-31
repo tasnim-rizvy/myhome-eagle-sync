@@ -171,7 +171,7 @@ class Eagle_Field_Manager {
 	 * @return int The new field ID (post ID), or 0 on failure.
 	 */
 	public function create_field( string $eagleKey, string $label, string $type ): int {
-		$slug = self::key_to_slug( $eagleKey );
+		$slug = self::SLUG_ALIASES[ $eagleKey ] ?? self::key_to_slug( $eagleKey );
 
 		$postId = wp_insert_post(
 			[
@@ -199,7 +199,16 @@ class Eagle_Field_Manager {
 			update_post_meta( $postId, 'multiple_values', '1' );
 		}
 
+		if ( 'taxonomy' === $type ) {
+			$tax = 'myhome_' . $postId;
+			if ( ! taxonomy_exists( $tax ) ) {
+				register_taxonomy( $tax, 'myhome_listing' );
+			}
+		}
+
 		Eagle_Logger::log( sprintf( 'Created field "%s" (id %d, type %s) for Eagle key %s.', $label, $postId, $type, $eagleKey ) );
+
+		$this->ensure_in_fields_order( $postId );
 
 		return (int) $postId;
 	}
@@ -228,23 +237,18 @@ class Eagle_Field_Manager {
 	 * If no existing field matches, one is created automatically.
 	 */
 	public function get_field_map(): array {
+		global $wpdb;
 		static $cached = null;
 
 		if ( null !== $cached ) {
 			return $cached;
 		}
 
-		$persistent = get_transient( self::FIELD_MAP_CACHE );
-		if ( is_array( $persistent ) ) {
-			return $cached = $persistent;
-		}
-
+		// Always rebuild from the live field set. A persistent cache would
+		// hide type corrections (e.g. a demo "postcode" field stored as
+		// taxonomy) and stale field IDs after fields are deleted. The static
+		// $cached var keeps this cheap within a single request.
 		$fields = $this->existing_fields();
-		if ( empty( $fields ) ) {
-			$cached = [];
-			set_transient( self::FIELD_MAP_CACHE, $cached, HOUR_IN_SECONDS );
-			return $cached;
-		}
 
 		$usage = $this->usage_ranking( $fields );
 
@@ -303,14 +307,37 @@ class Eagle_Field_Manager {
 				$pattern = false !== strpos( $key, 'video' ) ? 'video' : 'tour';
 				$field   = $this->first_match(
 					$fields,
-					static fn( array $f ) => 'embed' === $f['type'] && false !== stripos( $f['title'], $pattern )
+					static fn( array $f ) => in_array( $f['type'], [ 'embed', 'text' ], true ) && false !== stripos( $f['title'], $pattern )
 				);
 			} elseif ( $key !== 'status' ) {
 				$slug  = self::SLUG_ALIASES[ $key ] ?? self::key_to_slug( $key );
-				$field = $this->first_match( $fields, static fn( array $f ) => $f['slug'] === $slug );
+				$field = $this->match_by_slug( $fields, $slug, $type );
 			}
 
 			if ( $field ) {
+				// A pre-existing field matched by slug but with the wrong type
+				// (e.g. a demo "postcode" field created as taxonomy instead of
+				// text). Correct it so write_fields stores the value in the
+				// format the Eagle key expects — otherwise the value is dropped.
+				if ( $field['type'] !== $type ) {
+					// Direct DB write + cache flush so the correction survives any
+					// object-cache layer and is not reverted by a stale read.
+					global $wpdb;
+					$wpdb->update(
+						$wpdb->postmeta,
+						[ 'meta_value' => $type ],
+						[ 'post_id' => $field['id'], 'meta_key' => 'type' ]
+					);
+					clean_post_cache( $field['id'] );
+					wp_cache_delete( $field['id'], 'post_meta' );
+					if ( 'taxonomy' === $type && ! taxonomy_exists( 'myhome_' . $field['id'] ) ) {
+						register_taxonomy( 'myhome_' . $field['id'], 'myhome_listing' );
+					}
+				}
+				// Ensure the field is in MyHome's fields_order so it renders
+				// on the listing edit screen (pre-existing fields are not
+				// auto-added by create_field).
+				$this->ensure_in_fields_order( $field['id'] );
 				$map[ $key ] = $field['id'];
 			} elseif ( $key !== 'status' ) {
 				// No existing field found — create one automatically.
@@ -319,18 +346,17 @@ class Eagle_Field_Manager {
 					$map[ $key ] = $newId;
 					// Add to the in-memory list so subsequent keys with the
 					// same slug reuse this field instead of creating another.
-					$fields[] = [
-						'id'    => $newId,
-						'type'  => $type,
-						'slug'  => self::key_to_slug( $key ),
-						'title' => $label,
-					];
+				$fields[] = [
+					'id'    => $newId,
+					'type'  => $type,
+					'slug'  => self::SLUG_ALIASES[ $key ] ?? self::key_to_slug( $key ),
+					'title' => $label,
+				];
 				}
 			}
 		}
 
 		$cached = $map;
-		set_transient( self::FIELD_MAP_CACHE, $cached, 6 * HOUR_IN_SECONDS );
 		return $cached;
 	}
 
@@ -350,10 +376,26 @@ class Eagle_Field_Manager {
 	 * that are otherwise considered "current".
 	 */
 	public function map_version(): string {
-		$map = $this->get_field_map();
-		ksort( $map );
+		// get_field_map() must run first — it builds the in-memory fields
+		// list with type corrections already applied. Calling existing_fields()
+		// independently could return a stale pre-correction type from the
+		// object cache, causing an unnecessary re-import.
+		$map    = $this->get_field_map();
+		$fields = $this->existing_fields();
+		$finger = [];
+		foreach ( $map as $key => $id ) {
+			$type = '';
+			foreach ( $fields as $f ) {
+				if ( (int) $f['id'] === (int) $id ) {
+					$type = $f['type'];
+					break;
+				}
+			}
+			$finger[ $key ] = $id . ':' . $type;
+		}
+		ksort( $finger );
 
-		return substr( hash( 'sha256', wp_json_encode( $map ) ), 0, 12 );
+		return substr( hash( 'sha256', wp_json_encode( $finger ) ), 0, 12 );
 	}
 
 	/**
@@ -471,5 +513,66 @@ class Eagle_Field_Manager {
 		}
 
 		return null;
+	}
+
+	/**
+	 * Match a field by slug, preferring the one MyHome actually renders
+	 * (present in `fields_order`), then one whose type already matches the
+	 * Eagle definition. This avoids picking a wrong-typed / invisible duplicate
+	 * when several fields share the same slug (e.g. a demo "postcode" stored as
+	 * taxonomy or a field missing from `fields_order`).
+	 */
+	private function match_by_slug( array $fields, string $slug, string $type ): ?array {
+		$order = $this->fields_order_ids();
+		$best  = null;
+		$bestInOrder = null;
+		foreach ( $fields as $field ) {
+			if ( $field['slug'] !== $slug ) {
+				continue;
+			}
+			if ( in_array( $field['id'], $order, true ) ) {
+				if ( $field['type'] === $type ) {
+					return $field;
+				}
+				if ( null === $bestInOrder ) {
+					$bestInOrder = $field;
+				}
+			} elseif ( null === $best ) {
+				$best = $field;
+			}
+		}
+
+		return $bestInOrder ?? $best;
+	}
+
+	/**
+	 * Register a resolved/existing field id in MyHome's `fields_order` so the
+	 * field is actually rendered on the listing edit screen. Pre-existing
+	 * fields are not auto-added by `create_field()`, yet a field absent from
+	 * `fields_order` is invisible even when its value is stored.
+	 */
+	private function ensure_in_fields_order( int $fieldId ): void {
+		$settings = get_option( 'myhome_settings', [] );
+		if ( ! is_array( $settings ) ) {
+			$settings = [];
+		}
+		if ( ! isset( $settings['fields_order'] ) || ! is_array( $settings['fields_order'] ) ) {
+			$settings['fields_order'] = [];
+		}
+		if ( in_array( $fieldId, $settings['fields_order'], true ) ) {
+			return;
+		}
+		$settings['fields_order'][] = $fieldId;
+		update_option( 'myhome_settings', $settings );
+		Eagle_Logger::log( sprintf( 'Added field id %d to myhome_settings fields_order.', $fieldId ) );
+	}
+
+	private function fields_order_ids(): array {
+		$settings = get_option( 'myhome_settings', [] );
+		if ( is_array( $settings ) && isset( $settings['fields_order'] ) && is_array( $settings['fields_order'] ) ) {
+			return $settings['fields_order'];
+		}
+
+		return [];
 	}
 }

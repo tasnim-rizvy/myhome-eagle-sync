@@ -442,6 +442,14 @@ wp_update_post(
 
 	private function write_fields( int $postId, array $data ): bool {
 		$map = $this->fields->get_field_map();
+		// The Eagle key's expected type. Using this (rather than the MyHome
+		// field's possibly stale cached type) keeps storage deterministic even
+		// when a pre-existing field was created with the wrong type (e.g. a
+		// "postcode" field stored as taxonomy instead of text).
+		$defTypes = [];
+		foreach ( Eagle_Field_Manager::field_definitions() as $dk => $def ) {
+			$defTypes[ $dk ] = $def[1];
+		}
 		$success = true;
 
 		foreach ( $map as $key => $fieldId ) {
@@ -472,7 +480,7 @@ wp_update_post(
 			$value = $data[ $key ];
 
 			try {
-				switch ( $field->getType() ) {
+				switch ( $defTypes[ $key ] ?? $field->getType() ) {
 					case 'price':
 						$field->setValue( $this->listing_model( $postId ), $this->price_value( $value, $fieldId ) );
 						break;
@@ -1183,17 +1191,29 @@ wp_update_post(
 
 		// The API nests the full address under `address.formattedFullAddress` but
 		// also exposes a short `formattedAddress` at the top level. Lift it so the
-		// field writer can store it like any other scalar.
-		if ( isset( $node['address']['formattedFullAddress'] ) && ! isset( $data['formattedFullAddress'] ) ) {
+		// field writer can store it like any other scalar. Fall back to the
+		// top-level `formattedAddress` when the nested one is empty — some Eagle
+		// accounts return the address only there.
+		if ( isset( $node['address']['formattedFullAddress'] ) && $node['address']['formattedFullAddress'] !== '' ) {
 			$data['formattedFullAddress'] = $node['address']['formattedFullAddress'];
+		} elseif ( ! empty( $node['formattedAddress'] ) ) {
+			$data['formattedFullAddress'] = $node['formattedAddress'];
 		}
 
 		// Parse suburb, state, postcode from the formatted address.
 		$fullAddr = $data['formattedFullAddress'] ?? '';
-		if ( preg_match( '/,\s*(.+?)\s+([A-Z]{2,3})\s+(\d{4})$/', $fullAddr, $addrMatch ) ) {
-			$data['suburb']  = $addrMatch[1];
+		if ( preg_match( '/,\s*(.+?)\s+([A-Z]{2,3})\s+(\d{4})\s*$/', $fullAddr, $addrMatch ) ) {
+			$data['suburb']  = trim( $addrMatch[1], ", \t\n\r\0\x0B" );
 			$data['state']   = $addrMatch[2];
 			$data['postcode'] = $addrMatch[3];
+			Eagle_Logger::log(
+				sprintf( 'Address parsed: suburb="%s" state="%s" postcode="%s"', $data['suburb'], $data['state'], $data['postcode'] )
+			);
+		} else {
+			// Diagnostics: log the raw address so a failed parse can be inspected.
+			Eagle_Logger::log(
+				sprintf( 'Address parse FAILED for "%s"', $fullAddr )
+			);
 		}
 
 		// Vendors come as a nested object — store as JSON text.

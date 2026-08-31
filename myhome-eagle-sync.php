@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MES_VERSION', '0.3.4' );
+define( 'MES_VERSION', '0.3.5' );
 define( 'MES_PLUGIN_FILE', __FILE__ );
 define( 'MES_PLUGIN_PATH', plugin_dir_path( __FILE__ ) );
 define( 'MES_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
