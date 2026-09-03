@@ -649,6 +649,8 @@ wp_update_post(
 		$pending       = [];
 		$seen          = [];
 
+		usort( $images, static fn( array $a, array $b ) => ( (int) ( $a['position'] ?? 0 ) ) - ( (int) ( $b['position'] ?? 0 ) ) );
+
 		foreach ( $images as $image ) {
 			$url = (string) ( $image['url'] ?? '' );
 			if ( $url === '' ) {
